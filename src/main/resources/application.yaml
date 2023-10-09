@@ -1,0 +1,34 @@
+server:
+  port: 10086
+
+spring:
+  application:
+    name: myhd
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/JHDP?useSSL=false&serverTimezone=UTC
+    username: huangjinhui
+    password: huangjinhui
+    type: com.alibaba.druid.pool.DruidDataSource
+
+  redis:
+    host: 127.0.0.1
+    port: 6379
+    password: 12345678hjh
+    database: 0
+    lettuce:
+      pool:
+        max-active: 8
+        max-idle: 8
+        min-idle: 1
+        time-between-eviction-runs: 10s
+  jackson:
+    default-property-inclusion: non_null # JSON处理忽略非空字段
+mybatis-plus:
+  type-aliases-package: com.myhd.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    # cache-enabled: true # 二级缓存
+logging:
+  level:
+    com.myhd: debug

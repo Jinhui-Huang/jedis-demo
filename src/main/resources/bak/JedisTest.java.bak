@@ -1,0 +1,78 @@
+
+import com.myhd.util.JedisConnectionFactory;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.SpringBootTest;
+import redis.clients.jedis.Jedis;
+
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Description: JedisTest
+ * <br></br>
+ * className: JedisTest
+ * <br></br>
+ * packageName: PACKAGE_NAME
+ *
+ * @author jinhui-huang
+ * @version 1.0
+ * @email 2634692718@qq.com
+ * @Date: 2023/10/5 10:39
+ */
+@SpringBootTest
+public class JedisTest {
+    private Jedis jedis;
+
+    @BeforeEach
+    public void setUp() {
+        jedis = JedisConnectionFactory.getJedis();
+        jedis.select(0);
+    }
+
+    /**
+     * Description: testJedis 测试使用Jedis获取Redis里面key的值
+     * @return void
+     * @author jinhui-huang
+     * @Date 2023/10/5
+     * */
+    @Test
+    public void testJedis() {
+        /*String set = jedis.set("name", "张三");
+        System.out.println("result=" + set);*/
+        String name = jedis.get("name");
+        System.out.println("name=" + name);
+        List<String> list = jedis.zrangeByScore("stus", 0, 85);
+        System.out.println(list);
+        Set<String> smembers = jedis.smembers("张三");
+        System.out.println(smembers);
+        Map<String, String> stringMap = jedis.hgetAll("project:user:4");
+        System.out.println(stringMap);
+    }
+
+    /**
+     * Description: testHash 测试使用Jedis插入Redis数据
+     * @return void
+     * @author jinhui-huang
+     * @Date 2023/10/5
+     * */
+    @Test
+    public void testHash() {
+        /*插入hash数据*/
+        jedis.hset("user:1", "name", "Jack");
+        jedis.hset("user:1", "age", "21");
+
+        /*获取数据*/
+        Map<String, String> stringMap = jedis.hgetAll("user:1");
+        System.out.println(stringMap);
+    }
+
+    @AfterEach
+    public void tearDown() {
+        if (jedis != null) {
+            jedis.close();
+        }
+    }
+}
