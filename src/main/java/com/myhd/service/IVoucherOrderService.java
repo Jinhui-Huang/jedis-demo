@@ -1,5 +1,6 @@
 package com.myhd.service;
 
+import com.myhd.dto.Result;
 import com.myhd.entity.VoucherOrder;
 import com.baomidou.mybatisplus.extension.service.IService;
 
@@ -13,4 +14,7 @@ import com.baomidou.mybatisplus.extension.service.IService;
  */
 public interface IVoucherOrderService extends IService<VoucherOrder> {
 
+    Result scekillVoucher(Long voucherId);
+
+    Result createVoucherOrder(Long voucherId, Long userId);
 }

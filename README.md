@@ -1719,21 +1719,634 @@ ID就存在一些问题:
 
 为了增加ID的安全性, 我们可以不直接使用Redis自增的数值, 而是拼接一些其他信息:
 
-![image-20231009121035851](/home/huian/.config/Typora/typora-user-images/image-20231009121035851.png)
+![image-20231009121035851](src/main/resources/img/image-20231009121035851.png)
+
+ID的组成部分: 
+
+- 符号位: 1bit, 永远为0
+- 时间戳: 31bit, 以秒为单位, 可以使用69年
+- 序列号: 32bit, 秒内的计数器, 支持每秒产生2^32个不同ID
+
+全局唯一ID生成策略:
+
+- UUID
+- Redis自增
+- snowflake算法
+- 数据库自增
+
+Redis自增ID策略:
+
+- 每天一个key, 方便统计订单量
+- ID构造是 时间戳 +计数器
+
+**RedisIdWorker**
+
+``````java
+@Component
+public class RedisIdWorker {
+
+    /**开始时间戳*/
+    private static final long BEGIN_TIMESTAMP = 1640995200L;
+
+    private static final long COUNT_BITS = 32L;
+
+    private StringRedisTemplate stringRedisTemplate;
+
+    public RedisIdWorker(StringRedisTemplate stringRedisTemplate) {
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+
+
+    public long nextId(String keyPrefix) {
+        /*1. 生成时间戳*/
+        LocalDateTime now = LocalDateTime.now();
+        long nowSecond = now.toEpochSecond(ZoneOffset.UTC);
+        long timestamp = nowSecond - BEGIN_TIMESTAMP;
+
+        /*2. 生成序列号*/
+        /*2.1 获取当前日期, 精确到天*/
+        String date = now.format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        long count = stringRedisTemplate.opsForValue().increment("icr:" + keyPrefix + ":" + date);
+
+        /*3. 拼接并返回*/
+        return timestamp << COUNT_BITS | count;
+    }
+}
+
+``````
+
+
 
 ### 2. 实现优惠卷秒杀下单
+
+每个店铺都可以发布优惠卷, 分为卷和特价卷, 评价卷可以任意购买, 而特价卷需要秒杀抢购
+
+下单时需要判断两点:
+
+- 秒杀是否开始或结束, 如果尚未开始或已经结束则无法下单
+- 库存是否充足, 不足则无法下单
+
+![image-20231009195258085](src/main/resources/img/image-20231009195258085.png)
+
+**VoucherOrderServiceImpl**
+
+``````java
+@Service
+public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+
+    @Resource
+    private ISeckillVoucherService seckillVoucherService;
+
+    @Resource
+    private RedisIdWorker redisIdWorker;
+
+    @Override
+    @Transactional
+    public Result scekillVoucher(Long voucherId) {
+        /*1. 查询优惠卷*/
+        SeckillVoucher seckillVoucher = seckillVoucherService.getById(voucherId);
+        /*2. 判断秒杀是否开始*/
+        if (seckillVoucher.getBeginTime().isAfter(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀尚未开始!");
+        }
+        /*3. 判断秒杀是否已经结束*/
+        if (seckillVoucher.getEndTime().isBefore(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀已经结束!");
+        }
+        /*4. 判断库存是否充足*/
+        if (seckillVoucher.getStock() < 1) {
+            /*库存不足*/
+            return Result.fail("库存不足");
+        }
+        /*5. 扣减库存*/
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId).update();
+        if (!success) {
+            /*扣减失败*/
+            return Result.fail("库存不足!");
+        }
+        /*6. 创建订单*/
+        VoucherOrder voucherOrder = new VoucherOrder();
+        /*6.1 订单id*/
+        long orderId = redisIdWorker.nextId("order");
+        voucherOrder.setId(orderId);
+        /*6.2 用户id*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        voucherOrder.setUserId(userId);
+        /*6.3 代金卷id*/
+        voucherOrder.setVoucherId(voucherId);
+
+        save(voucherOrder);
+
+        /*7. 返回订单id*/
+        return Result.ok(orderId);
+    }
+}
+``````
 
 
 
 ### 3. 超卖问题
 
+![image-20231009213855142](src/main/resources/img/image-20231009213855142.png)
+
+#### 超卖解决方法: 悲观锁 vs 乐观锁
+
+超卖问题是典型的多线程安全问题, 针对这一问题的常见解决方案就是加锁: 
+
+- 悲观锁:  认为线程安全问题一定会发生, 因此在操作数据之前先获取锁, 确保线程串行执行.
+  - 例如Synchronized, Lock都属于悲观锁
+- 乐观锁: 认为线程安全问题不一定会发生, 因此不加锁, 只是在更新数据时去判断有没有其他线程对数据做了更改.
+  - 如果没有修改则认为是安全的, 自己才更新数据.
+  - 如果已经被其他线程修改说明发生了安全问题, 此时可以重试或异常
+
+
+
+**乐观锁**
+
+乐观锁的关键是判断之前查询得到的数据是否有被修改过, 常见的方式有两种: 
+
+- 版本号法: 
+
+  ![image-20231009215715041](src/main/resources/img/image-20231009215715041.png)
+
+
+
+- CAS法
+
+  ![image-20231009220117966](src/main/resources/img/image-20231009220117966.png)
+
+**乐观锁的弊端:**
+
+一旦前后版本号或数值不一致就失败了, 存在成功率低的问题, 当前业务只要满足优惠卷大于0即可, 因此可以把两次相等的条件改为优惠卷的数量大于0即可, 只要库存不小0就不会发生超卖问题.
+
+
+
+**乐观锁的实现**
+
+``````java
+@Service
+public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+
+    @Resource
+    private ISeckillVoucherService seckillVoucherService;
+
+    @Resource
+    private RedisIdWorker redisIdWorker;
+
+    @Override
+    @Transactional
+    public Result scekillVoucher(Long voucherId) {
+        /*1. 查询优惠卷*/
+        SeckillVoucher seckillVoucher = seckillVoucherService.getById(voucherId);
+        /*2. 判断秒杀是否开始*/
+        if (seckillVoucher.getBeginTime().isAfter(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀尚未开始!");
+        }
+        /*3. 判断秒杀是否已经结束*/
+        if (seckillVoucher.getEndTime().isBefore(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀已经结束!");
+        }
+        /*4. 判断库存是否充足*/
+        if (seckillVoucher.getStock() < 1) {
+            /*库存不足*/
+            return Result.fail("库存不足");
+        }
+        /*5. 扣减库存*/
+        /*TODO 扣减前加个sql条件判断一下查询到stock的值前后是否一致*/
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId)
+                .gt("stock", 0) /*where id = ? and stock > 0*/
+                .update();
+
+        if (!success) {
+            /*扣减失败*/
+            return Result.fail("库存不足!");
+        }
+        /*6. 创建订单*/
+        VoucherOrder voucherOrder = new VoucherOrder();
+        /*6.1 订单id*/
+        long orderId = redisIdWorker.nextId("order");
+        voucherOrder.setId(orderId);
+        /*6.2 用户id*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        voucherOrder.setUserId(userId);
+        /*6.3 代金卷id*/
+        voucherOrder.setVoucherId(voucherId);
+
+        save(voucherOrder);
+
+        /*7. 返回订单id*/
+        return Result.ok(orderId);
+    }
+}
+``````
+
 
 
 ### 4. 一人一单
 
+需求: 修改秒杀业务, 要求同一个优惠卷只能下一个单
+
+实现代码: 
+
+``````java
+@Service
+public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+
+    @Resource
+    private ISeckillVoucherService seckillVoucherService;
+
+    @Resource
+    private RedisIdWorker redisIdWorker;
+
+    @Override
+    public Result scekillVoucher(Long voucherId) {
+        /*1. 查询优惠卷*/
+        SeckillVoucher seckillVoucher = seckillVoucherService.getById(voucherId);
+        /*2. 判断秒杀是否开始*/
+        if (seckillVoucher.getBeginTime().isAfter(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀尚未开始!");
+        }
+        /*3. 判断秒杀是否已经结束*/
+        if (seckillVoucher.getEndTime().isBefore(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀已经结束!");
+        }
+        /*4. 判断库存是否充足*/
+        if (seckillVoucher.getStock() < 1) {
+            /*库存不足*/
+            return Result.fail("库存不足");
+        }
+        /*TODO: 注意spring事务实在synchronized释放锁后再提交事务的, 但是在synchronized释放锁后
+         *  有可能导致其他线程进来执行代码同时也执行sql语句了, 从而导致线程并发安全, 所以必须在事务提交之后再释放锁*/
+        /*6.0. 一人一单*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*一个用户一把锁, 保证所对象只针对这个用户, 所对象对当前用户唯一*/
+        synchronized (userId.toString().intern()) {
+            /*获取事务的代理对象*/
+            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+            return proxy.createVoucherOrder(voucherId, userId);
+        }
+    }
+
+    /**
+     * Description: createVoucherOrder 封装创建订单的方法, 使用spring管理的事务
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/10
+     * */
+    @Transactional
+    @Override
+    public Result createVoucherOrder(Long voucherId, Long userId) {
+
+        /*6.1. 查询订单*/
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+        /*6.2. 判断是否存在*/
+        if (count > 0) {
+            /*用户已经购买过了*/
+            return Result.fail("用户已经购买过了");
+        }
+
+        /*5. 扣减库存*/
+        /*TODO 扣减前加个sql条件判断一下查询到stock的值是否大于0*/
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId)
+                .gt("stock", 0) /*where id = ? and stock > 0*/
+                .update();
+
+        if (!success) {
+            /*扣减失败*/
+            return Result.fail("库存不足!");
+        }
+
+        /*6. 创建订单*/
+        VoucherOrder voucherOrder = new VoucherOrder();
+        /*6.1 订单id*/
+        long orderId = redisIdWorker.nextId("order");
+        voucherOrder.setId(orderId);
+        /*6.2 用户id*/
+        voucherOrder.setUserId(userId);
+        /*6.3 代金卷id*/
+        voucherOrder.setVoucherId(voucherId);
+
+        save(voucherOrder);
+        /*7. 返回订单id*/
+        return Result.ok(orderId);
+
+    }
+}
+``````
+
 
 
 ### 5. 分布式锁
+
+通过加锁可以解决在单机情况下的一人一单安全问题, 但是在集群模式下就不行了
+
+解决方式就是必须要使用一个集群的锁监视器
+
+![image-20231010184106446](src/main/resources/img/image-20231010184106446.png)
+
+**分布式锁:** 满足分布式系统或集群模式下多进程可见并且互斥的锁.
+
+![image-20231010184456356](src/main/resources/img/image-20231010184456356.png)
+
+**分布式锁的实现**
+
+分布式锁的核心是实现多进程之间互斥, 而满足这一点的方式有很多, 常见的有三种: 
+
+|        |           MySQL           |          Redis           |            Zookeeper             |
+| :----: | :-----------------------: | :----------------------: | :------------------------------: |
+|  互斥  | 利用mysql本身的互斥锁机制 | 利用setnx这样的互斥命令  | 利用节点的唯一性和有序性实现互斥 |
+| 高可用 |            好             |            好            |                好                |
+| 高性能 |           一般            |            好            |               一般               |
+| 安全性 |   断开连接, 自动释放锁    | 利用锁超时时间, 到期释放 |    临时节点, 断开连接自动释放    |
+
+
+
+**基于Redis的分布式锁**
+
+实现分布式锁时需要实现的两个基本方式:
+
+- 获取锁: 
+
+  - 互斥: 确保只能有一个线程获取锁
+
+  - 非阻塞: 尝试一次, 成功返回true, 失败返回false
+
+    ``````cmd
+    # 添加锁, 同时添加锁过期时间, 避免服务宕机引起
+    SETNX lock thread1 NX EX 10
+    ``````
+
+- 释放锁: 
+
+  - 手动释放锁
+
+  - 超时释放锁: 获取锁时添加一个超时时间
+
+    ``````cmd
+    # 释放锁, 删除即可
+    DEL key
+    ``````
+
+    ![image-20231010190349884](src/main/resources/img/image-20231010190349884.png)
+
+#### (1). 基于Redis实现分布式锁的初级版本
+
+``````java
+@Service
+public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+
+    @Resource
+    private ISeckillVoucherService seckillVoucherService;
+
+    @Resource
+    private RedisIdWorker redisIdWorker;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Override
+    public Result scekillVoucher(Long voucherId) {
+        /*1. 查询优惠卷*/
+        SeckillVoucher seckillVoucher = seckillVoucherService.getById(voucherId);
+        /*2. 判断秒杀是否开始*/
+        if (seckillVoucher.getBeginTime().isAfter(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀尚未开始!");
+        }
+        /*3. 判断秒杀是否已经结束*/
+        if (seckillVoucher.getEndTime().isBefore(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀已经结束!");
+        }
+        /*4. 判断库存是否充足*/
+        if (seckillVoucher.getStock() < 1) {
+            /*库存不足*/
+            return Result.fail("库存不足");
+        }
+        /*TODO: 注意spring事务实在synchronized释放锁后再提交事务的, 但是在synchronized释放锁后
+         *  有可能导致其他线程进来执行代码同时也执行sql语句了, 从而导致线程并发安全, 所以必须在事务提交之后再释放锁*/
+        /*6.0. 一人一单*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*一个用户一把锁, 保证所对象只针对这个用户, 所对象对当前用户唯一*/
+        /*创建锁对象*/
+        SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+        /*获取锁*/
+        boolean isLock = lock.tryLock(5);
+        /*判断是否获取锁成功*/
+        if (!isLock) {
+            /*获取锁失败, 返回错误信息或重试*/
+            return Result.fail("不允许重复下单");
+        }
+        /*获取锁成功*/
+        try {
+            /*获取事务的代理对象*/
+            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+            return proxy.createVoucherOrder(voucherId, userId);
+        } finally {
+            lock.unlock();
+        }
+
+
+    }
+
+    /**
+     * Description: createVoucherOrder 封装创建订单的方法, 使用spring管理的事务
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/10
+     * */
+    @Transactional
+    @Override
+    public Result createVoucherOrder(Long voucherId, Long userId) {
+
+        /*6.1. 查询订单*/
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+        /*6.2. 判断是否存在*/
+        if (count > 0) {
+            /*用户已经购买过了*/
+            return Result.fail("用户已经购买过了");
+        }
+
+        /*5. 扣减库存*/
+        /*TODO 扣减前加个sql条件判断一下查询到stock的值是否大于0*/
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId)
+                .gt("stock", 0) /*where id = ? and stock > 0*/
+                .update();
+
+        if (!success) {
+            /*扣减失败*/
+            return Result.fail("库存不足!");
+        }
+
+        /*6. 创建订单*/
+        VoucherOrder voucherOrder = new VoucherOrder();
+        /*6.1 订单id*/
+        long orderId = redisIdWorker.nextId("order");
+        voucherOrder.setId(orderId);
+        /*6.2 用户id*/
+        voucherOrder.setUserId(userId);
+        /*6.3 代金卷id*/
+        voucherOrder.setVoucherId(voucherId);
+
+        save(voucherOrder);
+        /*7. 返回订单id*/
+        return Result.ok(orderId);
+
+    }
+}
+``````
+
+
+
+锁的实现代码: 
+
+``````java
+public class SimpleRedisLock implements ILock{
+
+    private static final String KEY_PREFIX = "lock:";
+
+    /**业务名称*/
+    private String name;
+
+    private StringRedisTemplate stringRedisTemplate;
+
+    public SimpleRedisLock(String name, StringRedisTemplate stringRedisTemplate) {
+        this.name = name;
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+
+    /**
+     * Description: tryLock 尝试获取锁
+     *
+     * @param timeoutSec 锁持有的超时时间, 过期后自动释放锁
+     * @return boolean true代表获取锁成功, false代表获取锁失败
+     * @author jinhui-huang
+     * @Date 2023/10/10
+     */
+    @Override
+    public boolean tryLock(long timeoutSec) {
+        /*获取线程标识*/
+        long threadId = Thread.currentThread().getId();
+
+        /*获取锁*/
+        Boolean success = stringRedisTemplate.opsForValue()
+                .setIfAbsent(KEY_PREFIX + name, String.valueOf(threadId), Duration.ofSeconds(timeoutSec));
+        return Boolean.TRUE.equals(success);
+    }
+
+    /**
+     * Description: unlock 释放锁
+     *
+     * @return void
+     * @author jinhui-huang
+     * @Date 2023/10/10
+     */
+    @Override
+    public void unlock() {
+        /*释放锁*/
+        stringRedisTemplate.delete(KEY_PREFIX + name);
+    }
+}
+``````
+
+
+
+#### (2). Redis分布式锁初级版本的问题
+
+业务太复杂, 导致获取锁的线程阻塞时间太长, 以至于超过了锁的过期时间, 这时候其他线程又能拿到锁进入业务了, 产生并发安全问题, 当初第一次线程执行完业务时, 又删除了锁, 导致又有新线程拿到锁进来执行业务
+
+A. 锁误删(业务阻塞在获取锁后): 
+
+![image-20231010204443998](src/main/resources/img/image-20231010204443998.png)
+
+**解决方案:**给锁加一个锁标示
+
+B. 锁误删(业务阻塞在获取锁标示和锁释放之间)
+
+![image-20231010214023711](src/main/resources/img/image-20231010214023711.png)
+
+**解决方案:**Lua脚本实现获取锁标示和锁释放的原子性
+
+### (3). Redis的Lua脚本
+
+Redis提供了Lua脚本功能, 在一个脚本中编写多条Redis命令, 确保多条命令执行时的原子性. Lua是一种编程语言
+
+**使用Redis提供的函数语法, 语法如下:** 
+
+``````cmd
+# 执行redis命令, 调用脚本
+redis.call('命令名称', 'key', '其他参数', ....)
+``````
+
+例如: 执行set name jack, 参数0是因为这里参数写死了 则脚本如下: 
+
+``````cmd
+# 执行 set name jack
+redis.call('set', 'name', 'jack')
+``````
+
+例如: 执行set name Rose, 在执行get name,  则脚本如下: 
+
+``````cmd
+# 先执行 set name jack
+return redis.call('set', 'name', 'jack')
+# 再执行 get name
+local name = redis.call('get', 'name')
+# 返回
+return name
+``````
+
+
+
+**使用Redis的Lua脚本调用方法:**
+
+![image-20231010230521924](src/main/resources/img/image-20231010230521924.png)
+
+#### (4). 改进Redis的分布式锁
+
+要求: 修改之前的分布式锁实现, 满足: 
+
+1.  在获取锁时存入线程标示 (可以用UUID表示)
+
+2. 在释放锁时先获取锁中的线程标示, 判断是否与当前线程标示一致
+
+   - 如果一致则释放锁
+   - 如果不一致则不释放锁
+
+3. 使用Lua脚本执行: 
+
+   ``````lua
+   -- 获取锁中的线程标识 get key
+   local id = redis.call('get', KEYS[1])
+   -- 比较线程标示与锁中的标示是否一致
+   if (id == ARGV[1]) then
+       -- 释放锁 del key
+       return redis.call('del', KEYS[1])
+   end
+   return 0
+   ``````
+
+   
+
+**改造SimpleRedisLock**
+
+``````java
+
+``````
 
 
 

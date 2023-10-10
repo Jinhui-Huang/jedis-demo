@@ -87,6 +87,11 @@
             <version>1.2.18</version>
         </dependency>
 
+        <dependency>
+            <groupId>org.aspectj</groupId>
+            <artifactId>aspectjweaver</artifactId>
+        </dependency>
+
         <!-- TODO V2.0 SDK  -->
         <dependency>
             <groupId>com.aliyun</groupId>

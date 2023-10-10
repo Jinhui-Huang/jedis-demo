@@ -14,6 +14,8 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.Instant;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 
 /**
  * Description: LocalDateTiemSerlizerCofing
@@ -63,7 +65,13 @@ public class LocalDateTimeSerializerConfig {
             if (timestamp > 0) {
                 return LocalDateTime.ofInstant(Instant.ofEpochMilli(timestamp), ZoneId.systemDefault());
             } else {
-                return null;
+                try {
+                    DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+                    return LocalDateTime.parse(p.getText(), formatter);
+                } catch (DateTimeParseException e) {
+                    return null;
+                }
+
             }
         }
     }

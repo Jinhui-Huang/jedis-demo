@@ -2,17 +2,14 @@ package com.myhd.controller;
 
 
 import com.myhd.dto.Result;
-import org.apache.catalina.session.StandardSession;
+import com.myhd.service.IVoucherOrderService;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 
 import org.springframework.web.bind.annotation.RestController;
 
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletRequestWrapper;
-import javax.servlet.http.HttpSession;
-import java.util.Properties;
+import javax.annotation.Resource;
 
 /**
  * <p>
@@ -25,8 +22,12 @@ import java.util.Properties;
 @RestController
 @RequestMapping("/voucher-order")
 public class VoucherOrderController {
+
+    @Resource
+    private IVoucherOrderService voucherOrderService;
+
     @PostMapping("seckill/{id}")
     public Result seckillVoucher(@PathVariable("id") Long voucherId) {
-        return Result.fail("功能未完成");
+        return voucherOrderService.scekillVoucher(voucherId);
     }
 }

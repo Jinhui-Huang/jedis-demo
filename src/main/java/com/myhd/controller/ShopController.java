@@ -38,7 +38,7 @@ public class ShopController {
     public Result queryShopById(@PathVariable("id") Long id) {
         /*基于互斥锁解决缓存击穿问题 DEAL_CACHE_STAVE_BY_LOCK*/
         /*基于逻辑过期解决缓存击穿问题DEAL_CACHE_STAVE_BY_LOGIC*/
-        return shopService.queryById(id, DEAL_CACHE_STAVE_BY_LOCK);
+        return shopService.queryById(id, DEAL_CACHE_STAVE_BY_LOGIC);
     }
 
     /**
