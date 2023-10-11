@@ -2281,7 +2281,7 @@ B. 锁误删(业务阻塞在获取锁标示和锁释放之间)
 
 **解决方案:**Lua脚本实现获取锁标示和锁释放的原子性
 
-### (3). Redis的Lua脚本
+#### (3). Redis的Lua脚本
 
 Redis提供了Lua脚本功能, 在一个脚本中编写多条Redis命令, 确保多条命令执行时的原子性. Lua是一种编程语言
 
@@ -2330,21 +2330,233 @@ return name
 3. 使用Lua脚本执行: 
 
    ``````lua
-   -- 获取锁中的线程标识 get key
-   local id = redis.call('get', KEYS[1])
    -- 比较线程标示与锁中的标示是否一致
-   if (id == ARGV[1]) then
+   if (redis.call('get', KEYS[1])== ARGV[1]) then
        -- 释放锁 del key
        return redis.call('del', KEYS[1])
    end
    return 0
    ``````
-
+   
    
 
 **改造SimpleRedisLock**
 
 ``````java
+public class SimpleRedisLock implements ILock{
+
+    private static final String KEY_PREFIX = "lock:";
+
+    private static final String ID_PREFIX = UUID.randomUUID() + "-";
+
+    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT;
+
+    /*初始化Lua脚本*/
+    static {
+        UNLOCK_SCRIPT = new DefaultRedisScript<>();
+        UNLOCK_SCRIPT.setLocation(new ClassPathResource("unlock.lua"));
+        UNLOCK_SCRIPT.setResultType(Long.class);
+    }
+
+    /**业务名称 + 用户id*/
+    private String name;
+
+    private StringRedisTemplate stringRedisTemplate;
+
+    public SimpleRedisLock(String name, StringRedisTemplate stringRedisTemplate) {
+        this.name = name;
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+
+    /**
+     * Description: tryLock 尝试获取锁
+     *
+     * @param timeoutSec 锁持有的超时时间, 过期后自动释放锁
+     * @return boolean true代表获取锁成功, false代表获取锁失败
+     * @author jinhui-huang
+     * @Date 2023/10/10
+     */
+    @Override
+    public boolean tryLock(long timeoutSec) {
+        /*获取线程标识*/
+        String threadId = ID_PREFIX + Thread.currentThread().getId();
+
+        /*获取锁*/
+        Boolean success = stringRedisTemplate.opsForValue()
+                .setIfAbsent(KEY_PREFIX + name, threadId, Duration.ofSeconds(timeoutSec));
+        return Boolean.TRUE.equals(success);
+    }
+
+    /**
+     * Description: unlock 释放锁
+     *
+     * @return void
+     * @author jinhui-huang
+     * @Date 2023/10/10
+     */
+    @Override
+    public void unlockNoLua() {
+        /*获取线程标示*/
+        String threadId = ID_PREFIX + Thread.currentThread().getId();
+        String id = stringRedisTemplate.opsForValue().get(KEY_PREFIX + name);
+        if (threadId.equals(id)) {
+            /*释放锁*/
+            stringRedisTemplate.delete(KEY_PREFIX + name);
+        }
+    }
+
+    @Override
+    public void unlock() {
+        /*调用lua脚本*/
+        stringRedisTemplate.execute(
+                UNLOCK_SCRIPT,
+                Collections.singletonList(KEY_PREFIX + name),
+                ID_PREFIX + Thread.currentThread().getId()
+        );
+    }
+}
+``````
+
+
+
+**基于Redis的分布式锁实现思路:**
+
+- 利用set nx ex获取锁, 并设置过期时间, 保存线程标示
+- 释放锁时先判断线程标示是否与自己一致, 一致则删除锁
+
+**特性:**
+
+- 利用set nx满足互斥性
+- 利用set nx保证故障时锁依然能释放, 避免死锁, 提高安全性
+- 利用Redis集群保证高可用和高并发特性
+
+#### (5). 基于Redis的分布式锁优化
+
+基于setnx实现的分布式锁存在下面的问题: 
+
+- 不可重入: 同一个线程无法多次获取同一把锁
+- 不可重试: 获取锁只尝试一次就返回false, 没有重试机制
+- 超时释放: 超市释放虽然可以避免死锁, 但如果是业务执行耗时比较长, 也会导致锁释放, 存在安全隐患
+- 主从一致性: 如果Redis提供了主从集群, 主从同步存在延迟, 当主宕机时, 如果从一并同步主中的锁数据, 则会出现锁实现
+
+#### (6). Redisson
+
+Redisson是一个在Redis的基础上实现的Java驻内存数据网络(In-Memory Data Grid). 它不仅提供了一系列的分布式的Java常用对象, 还提供了许多分布式服务, 其中就包含了各种分布式锁的实现.
+
+- 分布式锁(Lock) 和同步器 (Synchronizer)
+  - 可重入锁 (Reentrant Lock)
+  - 公平锁 (Fair Lock)
+  - 联锁 (MultiLock)
+  - 红锁 (RedLock)
+  - 读写锁 (ReadWriteLock)
+  - 信号量 (Semaphore)
+  - 可过期性信号量 (PermitExpirableSemaphore)
+  - 闭锁 (CountDownLatch)
+
+**Redisson入门:**
+
+1.  引入依赖: 
+
+   ``````xml
+   <!-- TODO Redisson: https://mvnrepository.com/artifact/org.redisson/redisson -->
+           <dependency>
+               <groupId>org.redisson</groupId>
+               <artifactId>redisson</artifactId>
+               <version>3.23.5</version>
+           </dependency>
+   ``````
+
+   
+
+2. 配置Redisson客户端:
+
+   ``````java
+   @Configuration
+   public class RedissonConfig {
+   
+       @Bean
+       public RedissonClient redissonClient(){
+           /*配置*/
+           Config config = new Config();
+           config.useSingleServer().setAddress("redis://192.168.43.33:6379").setPassword("12345678hjh");
+           /*创建RedissonClient对象*/
+           return Redisson.create(config);
+       }
+   }
+   ``````
+
+   
+
+3. 使用Redisson的分布式锁
+
+   ``````txt
+   RLock lock = redissonClient.getLock(LOCK_ORDER_KEY + userId);
+   /*获取锁*/
+   /*失败不等待, 默认参数为: 锁释放时间为30s*/
+   boolean isLock = lock.tryLock();
+   ``````
+
+
+
+**Redisson可重入锁原理**
+
+实现同一个线程里获取到多个同一把锁的机制: 当线程一拿到锁的时候将锁的进入次数+1, 当释放锁的时候将锁的进入次数-1, 这时候当锁的次数为0时就表示这个线程已经执行完业务, 可以将这把锁给删除了
+
+![image-20231011232000922](/home/huian/.config/Typora/typora-user-images/image-20231011232000922.png)
+
+
+
+Lua实现获取锁
+
+``````lua
+-- 锁获取的脚本
+local key = KEYS[1]; -- 锁的key
+local threadId = ARGV[1]; -- 线程的唯一标识
+local releaseTime = ARGV[2]; -- 锁的自动释放时间
+
+-- 判断是否存在
+if(redis.call('exists', key) == 0) then
+    -- 不存在, 获取锁
+    redis.call('hset', key, threadId, '1')
+    -- 设置有效期
+    redis.call('expire', key, releaseTime);
+    return 1; -- 返回结果
+end;
+-- 锁已经存在, 判断threadId是否是自己
+if(redis.call('hexists', key, thread) == 1) then
+    -- 不存在, 获取锁, 重入次数+1
+    redis.call('hincrby', key, threadId, '1');
+    -- 设置有效期
+    redis.call('expire', key, releaseTime);
+    return 1; -- 返回结果
+end
+return 0; -- 代码走到这里, 说明获取锁的不是自己, 获取锁失败
+``````
+
+
+
+Lua实现释放锁
+
+``````lua
+-- 释放锁的脚本
+local key = KEYS[1]; -- 锁的key
+local threadId = ARGV[1]; -- 线程的唯一标识
+local releaseTime = ARGV[2]; -- 锁的自动释放时间
+-- 判断当前锁是否还是被自己持有
+if (redis.call('HEXISTS', key, threadId) == 0) then
+    return nil; -- 如果已经不是自己, 则直接返回
+end;
+-- 是自己的锁, 则重入次数-1return
+local count = redis.call('HINCRBY', key, threadId, -1);
+-- 判断是否重入次数是否已经为0
+if (count > 0) then
+    -- 大于0说明不能释放锁, 重置有效期然后返回
+    redis.call('EXPIRE', key, releaseTime);
+    return nil;
+else -- 等于0说明可以释放锁, 直接删除
+    redis.call('DEL', key);
+    return nil;
+end;
 
 ``````
 

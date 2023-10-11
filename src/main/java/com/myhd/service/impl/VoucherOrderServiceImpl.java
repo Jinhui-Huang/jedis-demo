@@ -9,10 +9,13 @@ import com.myhd.mapper.VoucherOrderMapper;
 import com.myhd.service.ISeckillVoucherService;
 import com.myhd.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.myhd.utils.RedisConstants;
 import com.myhd.utils.RedisIdWorker;
 import com.myhd.utils.SimpleRedisLock;
 import com.myhd.utils.UserHolder;
 import org.jetbrains.annotations.NotNull;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -20,6 +23,8 @@ import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
+
+import static com.myhd.utils.RedisConstants.LOCK_ORDER_KEY;
 
 /**
  * <p>
@@ -40,6 +45,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
+    private RedissonClient redissonClient;
 
     @Override
     public Result scekillVoucher(Long voucherId) {
@@ -66,9 +74,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         Long userId = UserHolder.getUser(UserDTO.class).getId();
         /*一个用户一把锁, 保证所对象只针对这个用户, 所对象对当前用户唯一*/
         /*创建锁对象*/
-        SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+        //SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+        RLock lock = redissonClient.getLock(LOCK_ORDER_KEY + userId);
         /*获取锁*/
-        boolean isLock = lock.tryLock(5);
+        /*失败不等待, 默认参数为: 锁释放时间为30s*/
+        boolean isLock = lock.tryLock();
         /*判断是否获取锁成功*/
         if (!isLock) {
             /*获取锁失败, 返回错误信息或重试*/

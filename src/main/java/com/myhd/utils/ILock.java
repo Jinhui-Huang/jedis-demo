@@ -23,6 +23,8 @@ public interface ILock {
      * */
     boolean tryLock(long timeoutSec);
 
+    void unlockNoLua();
+
     /**
      * Description: unlock 释放锁
      * @return void

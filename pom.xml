@@ -92,6 +92,13 @@
             <artifactId>aspectjweaver</artifactId>
         </dependency>
 
+        <!-- TODO Redisson: https://mvnrepository.com/artifact/org.redisson/redisson -->
+        <dependency>
+            <groupId>org.redisson</groupId>
+            <artifactId>redisson</artifactId>
+            <version>3.23.5</version>
+        </dependency>
+
         <!-- TODO V2.0 SDK  -->
         <dependency>
             <groupId>com.aliyun</groupId>
