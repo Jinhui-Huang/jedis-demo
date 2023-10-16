@@ -7,11 +7,16 @@ import com.myhd.mapper.VoucherMapper;
 import com.myhd.service.ISeckillVoucherService;
 import com.myhd.service.IVoucherService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.myhd.utils.RedisConstants;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
 import java.util.List;
+
+import static com.myhd.utils.RedisConstants.SECKILL_STOCK_KEY;
+import static com.myhd.utils.RedisConstants.SECKILL_VOUCHER_KEY;
 
 /**
  * <p>
@@ -26,6 +31,9 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
 
     @Resource
     private ISeckillVoucherService seckillVoucherService;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
 
     @Override
     public Result queryVoucherOfShop(Long shopId) {
@@ -47,5 +55,12 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         seckillVoucher.setBeginTime(voucher.getBeginTime());
         seckillVoucher.setEndTime(voucher.getEndTime());
         seckillVoucherService.save(seckillVoucher);
+
+        /*保存秒杀库存到Redis中*/
+        String key = SECKILL_VOUCHER_KEY + voucher.getId();
+
+        stringRedisTemplate.opsForHash().put(key, "stock", voucher.getStock().toString());
+        stringRedisTemplate.opsForHash().put(key, "beginTime", voucher.getBeginTime().toString());
+        stringRedisTemplate.opsForHash().put(key, "endTime", voucher.getEndTime().toString());
     }
 }

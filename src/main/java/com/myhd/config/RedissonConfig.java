@@ -25,7 +25,25 @@ public class RedissonConfig {
     public RedissonClient redissonClient(){
         /*配置*/
         Config config = new Config();
-        config.useSingleServer().setAddress("redis://192.168.43.33:6379").setPassword("12345678hjh");
+        config.useSingleServer().setAddress("redis://192.168.43.33:6379").setPassword("redis");
+        /*创建RedissonClient对象*/
+        return Redisson.create(config);
+    }
+
+    @Bean
+    public RedissonClient redissonClientSlave01(){
+        /*配置*/
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://192.168.43.33:6380").setPassword("redis");
+        /*创建RedissonClient对象*/
+        return Redisson.create(config);
+    }
+
+    @Bean
+    public RedissonClient redissonClientSlave02(){
+        /*配置*/
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://192.168.43.33:6381").setPassword("redis");
         /*创建RedissonClient对象*/
         return Redisson.create(config);
     }
