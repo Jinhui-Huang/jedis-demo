@@ -2917,4 +2917,369 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 - 生产者: 发送消息到消息队列
 - 消费者: 从消息队列获取消息并处理消息
 
-![image-20231015160937097](/home/huian/.config/Typora/typora-user-images/image-20231015160937097.png)
+![image-20231016183705838](/home/huian/.config/Typora/typora-user-images/image-20231016183705838.png)
+
+**Redis提供了三种不同的方法来实现消息队列:**
+
+- List结构: 基于List结构模拟消息队列
+- PubSub: 基本的点对点模型
+- Stream: 比较完善的消息队列模型
+
+#### (1). 基于List结构模拟消息队列
+
+**消息队列(Message Queue)**, 字面意思就是存放消息的队列, 而Redis的list数据结构是一个双向链表, 很容易模拟出队列效果.
+
+队列是入口和出口不在同一边, 因此我们可以利用: LPUSH结合RPOP, 或者RPUSH结合LPOP来实现
+
+不过要注意的是, 当队列中没有消息时RPOP或LPOP操作返回null, 并不像JVM的阻塞队列并等待消息.
+
+因此应该使用BRPOP或者BLPOP来实现阻塞效果
+
+
+
+**优点:**
+
+- 利用Redis存储, 不受限于JVM内存上限
+- 基于Redis的持久化机制, 数据安全性有保证
+- 可以满足消息有序性
+
+**缺点:**
+
+- 无法避免消息丢失
+- 只支持单消费者
+
+
+
+#### (2). 基于PubSub的消息队列
+
+**PubSub (发布订阅)**是Redis2.0版本引入的消息传递模型. 顾名思义, 消费者可以订阅一个或多个channel, 生产者向对应channel发送消息后, 所有订阅者都能收到相关消息
+
+- SUBSCRIBE channel[channel]: 订阅一个或多个频道
+- PUBLISH channel msg: 向一个频道发送消息
+- PSUBSCRIBE pattern[pattern]: 订阅与pattern格式匹配的所有频道
+
+![image-20231017113140584](/home/huian/.config/Typora/typora-user-images/image-20231017113140584.png)
+
+**基于PubSub的消息队列有哪些优缺点?**
+
+优点: 
+
+- 采用发布订阅模型, 支持多生产, 多消费
+
+缺点: 
+
+- 不支持数据持久化
+- 无法避免消息丢失
+- 消息堆积有上限, 超出时数据丢失
+
+#### (3). 基于Stream的消息队列
+
+Stream是Redis 5.0 引入的一种新数据类型, 可以实现一个功能非常完善的消息队列.
+
+![image-20231017120946677](/home/huian/.config/Typora/typora-user-images/image-20231017120946677.png)
+
+![image-20231017121007497](/home/huian/.config/Typora/typora-user-images/image-20231017121007497.png)
+
+**STREAM类型消息队列的XREAD命令特点:**
+
+- 消息可回溯
+- 一个消息可以被多个消费者读取
+- 可以阻塞读取
+- 有消息漏读的风险
+
+
+
+**消费者组(Consumer Group)**: 将多个消费者划分到一个组中, 监听同一个队列, 具备下列特点:
+
+1. 消息分流: 队列中的消息会分流给组内的不同消费者, 而不是重复消费, 从而加快消息处理的速度
+
+2. 消息标示: 消费组会维护一个标示, 记录最后一个被处理的消息, 哪怕消费者宕机重启, 还会从标示之后读取消息. 确保每一个消息都会被消费
+
+3. 消息确认: 消费者获取消息后, 消息处于pending状态, 并存入一个pending-list. 当处理完成后需要通过XACK来确认消息, 标记消息为已处理, 才会从pending-list移除.
+
+   ``````lua
+   XGROUP CREATE key groupName ID [MKSTREAM]
+   ``````
+
+   - key: 队列名称
+   - groupName: 消费者组名称
+   - ID: 起始ID标示, $代表队列中最后一个消息, 0则代表队列中第一个消息
+   - MKSTREAM: 队列不存在时自动创建队列
+
+   其它常见命令: 
+
+   ``````lua
+   # 删除指定的消费者组
+   XGROUP DESTORY key groupName
+   
+   # 给指定的消费者组添加消费者
+   XGROUP CREATECONSUMER key groupname consumername
+   
+   # 删除消费者组中的指定消费者
+   XGROUP DELCONSUMER key groupname consumername
+   ``````
+
+4. 从消费组获取消息: 
+
+   ![image-20231021135034098](/home/huian/.config/Typora/typora-user-images/image-20231021135034098.png)
+
+5. STREAM类型消息队列的XREADGROUP命令特点:
+   - 消息可回溯
+   - 可以多消费者争抢消息, 加快消费速度
+   - 可以阻塞读取
+   - 没有消息漏洞的风险
+   - 有消息确认机制, 保证消息至少被消费一次
+
+![image-20231021141250877](/home/huian/.config/Typora/typora-user-images/image-20231021141250877.png)
+
+#### (6). 基于Redis的Stream结构作为消息队列, 实现异步秒杀下单
+
+要求: 
+
+1. 创建一个Stream类型的消息队列, 名为stream.orders
+2. 修改之前的秒杀下单Lua脚本, 在认定有抢购资格后, 直接向stream.orders中添加消息, 内容包含voucherId, userId, orderId
+3. 项目启动时, 开启一个线程任务, 尝试获取stream.orders中的消息, 完成下单
+
+**Lua脚本**
+
+``````lua
+-- 1. 参数列表
+-- 1.1. 优惠卷id'
+local voucherId = ARGV[1]
+-- 1.2. 用户id
+local userId = ARGV[2]
+-- 1.3 订单id
+local orderId = ARGV[3]
+
+-- 2. 数据key
+-- 2.1. 库存key
+local voucherKey = 'seckill:voucher:' .. voucherId
+-- 2.2. 订单key
+local orderKey = 'seckill:order:' .. voucherId
+
+-- 3. 脚本业务
+-- 3.1. 判断库存是否充足 HGET voucherKey stock
+if(tonumber(redis.call('hget', voucherKey, 'stock')) <= 0) then
+    -- 3.2. 库存不足, 返回1
+    return 1
+end
+-- 3.2. 判断用户是否下单 SISMEMBER orderKey userId
+if (redis.call('sismember', orderKey, userId) == 1) then
+    -- 3.3. 存在, 说明重复下单, 返回2
+    return 2
+end
+-- 3.4. 扣库存 HINCRBY voucherKey stock -1
+redis.call('hincrby', voucherKey, 'stock', -1)
+-- 3.5. 下单 (保存用户) sadd orderKey userId
+redis.call('sadd', orderKey, userId)
+-- 3.6 发送消息到队列中, XADD stream.orders * k1 v1 k2 v2 ...
+redis.call('xadd', 'stream.orders', '*', 'userId', userId, 'voucherId', voucherId, 'id', orderId)
+return 0
+``````
+
+**实现代码:**
+
+``````java
+@Service
+public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+	/*基于Lua脚本的秒杀业务*/
+    @Override
+    public Result scekillVoucherByLua(Long voucherId) {
+        String key = SECKILL_VOUCHER_KEY + voucherId;
+        /*1. 从Redis查询优惠卷的信息*/
+        String beginTimeStr = (String) stringRedisTemplate.opsForHash().get(key, "beginTime");
+        String endTimeStr = (String) stringRedisTemplate.opsForHash().get(key, "endTime");
+        if (StringUtils.isAllBlank(beginTimeStr, endTimeStr)) {
+            return Result.fail("没有该优惠卷");
+        }
+        assert beginTimeStr != null;
+        LocalDateTime beginTime = LocalDateTime.parse(beginTimeStr);
+        assert endTimeStr != null;
+        LocalDateTime endTime = LocalDateTime.parse(endTimeStr);
+
+        /*2. 判断秒杀是否开始*/
+        if (beginTime.isAfter(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀尚未开始!");
+        }
+        /*3. 判断秒杀是否已经结束*/
+        if (endTime.isBefore(LocalDateTime.now())) {
+            /*尚未开始秒杀*/
+            return Result.fail("秒杀已经结束!");
+        }
+        /*获取用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*获取订单id*/
+        long orderId = redisIdWorker.nextId("order");
+        /*1. 执行lua脚本*/
+        Long result = stringRedisTemplate.execute(
+                SECKILL_SCRIPT, /*脚本文件*/
+                Collections.emptyList(), /*空集合*/
+                voucherId.toString(), /*优惠卷id*/
+                userId.toString(), /*用户id*/
+                String.valueOf(orderId) /*订单id*/
+        );
+        /*2. 判断结果是否为0*/
+        assert result != null;
+        int r = result.intValue();
+        if (r != 0) {
+            /*2.1. 不为0, 代表没有购买资格*/
+            return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
+        }
+                /*2.2. 为0, 有购买资格, 下单信息在Lua脚本中已经保存到Redis队列*/
+
+        /*获取事务的代理对象*/
+        proxy = (IVoucherOrderService) AopContext.currentProxy();
+
+        /*3. 返回订单id*/
+        return Result.ok(orderId);
+    }        
+
+		@Override
+        public void run() {
+            while (true) {
+                try {
+                    /*1. 获取Redis消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS streams.order >*/
+                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                            Consumer.from("g1", "c1"),
+                            StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
+                            StreamOffset.create(queueName, ReadOffset.lastConsumed())
+                    );
+                    /*2. 判断消息获取是否成功*/
+                    if (list == null || list.isEmpty()) {
+                        /*2.1. 如果获取失败, 说明没有消息, 继续下一次循环*/
+                        continue;
+                    }
+                    /*3.0. 解析消息中的订单信息*/
+                    MapRecord<String, Object, Object> record = list.get(0);
+                    Map<Object, Object> values = record.getValue();
+                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+                    /*3. 如果获取成功, 可以下单*/
+                    handleVoucherOrder(voucherOrder);
+                    /*4. ACK确认 SACK stream.orders g1 id*/
+                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
+                } catch (Exception e) {
+                    log.error("处理订单异常", e);
+                    handlePendingList();
+                }
+            }
+        }
+
+        private void handlePendingList() {
+            while (true) {
+                try {
+                    /*1. 获取pending-list消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS streams.order >*/
+                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                            Consumer.from("g1", "c1"),
+                            StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
+                            StreamOffset.create(queueName, ReadOffset.from("0"))
+                    );
+                    /*2. 判断消息获取是否成功*/
+                    if (list == null || list.isEmpty()) {
+                        /*2.1. 如果获取失败, 说明pending-list没有消息, 结束循环*/
+                        break;
+                    }
+                    /*3.0. 解析消息中的订单信息*/
+                    MapRecord<String, Object, Object> record = list.get(0);
+                    Map<Object, Object> values = record.getValue();
+                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+                    /*3. 如果获取成功, 可以下单*/
+                    handleVoucherOrder(voucherOrder);
+                    /*4. ACK确认 SACK stream.orders g1 id*/
+                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
+                } catch (Exception e) {
+                    log.error("处理pending-list订单异常", e);
+                    try {
+                        Thread.sleep(20);
+                    } catch (InterruptedException ex) {
+                        throw new RuntimeException(ex);
+                    }
+                }
+            }
+        }
+    }
+}
+``````
+
+
+
+## 六. 达人探店
+
+### 1. 发布探店笔记
+
+**探店笔记类似点评网站的评价, 往往是图文结合, 对应的表有两个: **
+
+- tb_blog: 探店笔记表, 包含笔记中的标题, 文字, 图片等
+- tb_blog_comments: 其他用户对探店笔记的评价
+
+
+
+**需求: 点击首页的探店笔记, 会进入详情页面, 实现该页面的查询接口: **
+
+``````java
+@Service
+public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IBlogService {
+
+    @Resource
+    private IUserService userService;
+
+    @Override
+    public Result queryBlogById(Long id) {
+        /*1. 查询blog*/
+        Blog blog = getById(id);
+        if (blog == null) {
+            return Result.fail("笔记不存在");
+        }
+        /*2. 查询blog有关的用户*/
+        queryBlogUser(blog);
+        return Result.ok(blog);
+    }
+
+    @Override
+    public Result queryHotBlog(Integer current) {
+        // 根据用户查询
+        Page<Blog> page = query()
+                .orderByDesc("liked")
+                .page(new Page<>(current, SystemConstants.MAX_PAGE_SIZE));
+        // 获取当前页数据
+        List<Blog> records = page.getRecords();
+        // 查询用户
+        records.forEach(this::queryBlogUser);
+        return Result.ok(records);
+    }
+
+    private void queryBlogUser(Blog blog) {
+        Long userId = blog.getUserId();
+        User user = userService.getById(userId);
+        blog.setName(user.getNickName());
+        blog.setIcon(user.getIcon());
+    }
+}
+``````
+
+
+
+### 2. 点赞
+
+在首页的探店笔记
+
+排行榜和探店图文详情页面都有点赞的功能: 
+
+#### (1). 完善点赞功能
+
+需求: 
+
+- 同一个用户只能点赞一次, 再次点赞则取消点赞
+- 如果当前用户已经点赞, 则点赞按钮高亮显示 (前段通过判断字段Blog累的isLike属性实现)
+
+
+
+实现步骤: 
+
+- 给Blog累添加一个isLike字段, 标示是否被当前用户点赞
+- 修改点赞功能, 利用Redis的set集合判断是否点赞过, 未点赞过则点赞数+1, 已点赞过则点赞数-1
+- 修改根据id查询Blog的业务, 判断当前登录用户是否点赞过, 赋值给isLike字段
+- 修改分页查询Blog业务, 判断当前登录用户是否点赞过, 赋值给isLike字段
+
+### 3. 点赞排行榜
+
