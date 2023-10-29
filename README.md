@@ -2502,7 +2502,7 @@ Redisson是一个在Redis的基础上实现的Java驻内存数据网络(In-Memor
 
 实现同一个线程里获取到多个同一把锁的机制: 当线程一拿到锁的时候将锁的进入次数+1, 当释放锁的时候将锁的进入次数-1, 这时候当锁的次数为0时就表示这个线程已经执行完业务, 可以将这把锁给删除了
 
-![image-20231011232000922](/home/huian/.config/Typora/typora-user-images/image-20231011232000922.png)
+![image-20231011232000922](src/main/resources/img/image-20231011232000922.png)
 
 
 
@@ -2574,11 +2574,11 @@ lock.tryLock(long waitTime, long leaseTime, TimeUnit unit)
 
 - 获取锁逻辑: 
 
-  ![image-20231012091018584](/home/huian/.config/Typora/typora-user-images/image-20231012091018584.png)
+  ![image-20231012091018584](src/main/resources/img/image-20231012091018584.png)
 
 - 释放锁逻辑
 
-  ![image-20231012091323803](/home/huian/.config/Typora/typora-user-images/image-20231012091323803.png)
+  ![image-20231012091323803](src/main/resources/img/image-20231012091323803.png)
 
 **Redisson分布式锁原理总结:**
 
@@ -2592,7 +2592,7 @@ lock.tryLock(long waitTime, long leaseTime, TimeUnit unit)
 
 - multiLock(联锁解决主从一致性问题)
 
-![image-20231012092514431](/home/huian/.config/Typora/typora-user-images/image-20231012092514431.png)
+![image-20231012092514431](src/main/resources/img/image-20231012092514431.png)
 
 **总结:**
 
@@ -2610,17 +2610,17 @@ lock.tryLock(long waitTime, long leaseTime, TimeUnit unit)
 
 ### 6. Redis优化秒杀
 
-![image-20231012131302128](/home/huian/.config/Typora/typora-user-images/image-20231012131302128.png)
+![image-20231012131302128](src/main/resources/img/image-20231012131302128.png)
 
 
 
 每一个业务都是同步执行, 所以需要使用异步秒杀机制, 同时结合Redis的缓存功能
 
-![image-20231012132245489](/home/huian/.config/Typora/typora-user-images/image-20231012132245489.png)
+![image-20231012132245489](src/main/resources/img/image-20231012132245489.png)
 
 
 
-![image-20231012133306075](/home/huian/.config/Typora/typora-user-images/image-20231012133306075.png)
+![image-20231012133306075](src/main/resources/img/image-20231012133306075.png)
 
 
 
@@ -2917,7 +2917,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 - 生产者: 发送消息到消息队列
 - 消费者: 从消息队列获取消息并处理消息
 
-![image-20231016183705838](/home/huian/.config/Typora/typora-user-images/image-20231016183705838.png)
+![image-20231016183705838](src/main/resources/img/image-20231016183705838.png)
 
 **Redis提供了三种不同的方法来实现消息队列:**
 
@@ -2958,7 +2958,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 - PUBLISH channel msg: 向一个频道发送消息
 - PSUBSCRIBE pattern[pattern]: 订阅与pattern格式匹配的所有频道
 
-![image-20231017113140584](/home/huian/.config/Typora/typora-user-images/image-20231017113140584.png)
+![image-20231017113140584](src/main/resources/img/image-20231017113140584.png)
 
 **基于PubSub的消息队列有哪些优缺点?**
 
@@ -2976,9 +2976,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
 Stream是Redis 5.0 引入的一种新数据类型, 可以实现一个功能非常完善的消息队列.
 
-![image-20231017120946677](/home/huian/.config/Typora/typora-user-images/image-20231017120946677.png)
+![image-20231017120946677](src/main/resources/img/image-20231017120946677.png)
 
-![image-20231017121007497](/home/huian/.config/Typora/typora-user-images/image-20231017121007497.png)
+![image-20231017121007497](src/main/resources/img/image-20231017121007497.png)
 
 **STREAM类型消息队列的XREAD命令特点:**
 
@@ -3021,7 +3021,7 @@ Stream是Redis 5.0 引入的一种新数据类型, 可以实现一个功能非�
 
 4. 从消费组获取消息: 
 
-   ![image-20231021135034098](/home/huian/.config/Typora/typora-user-images/image-20231021135034098.png)
+   ![image-20231021135034098](src/main/resources/img/image-20231021135034098.png)
 
 5. STREAM类型消息队列的XREADGROUP命令特点:
    - 消息可回溯
@@ -3030,7 +3030,7 @@ Stream是Redis 5.0 引入的一种新数据类型, 可以实现一个功能非�
    - 没有消息漏洞的风险
    - 有消息确认机制, 保证消息至少被消费一次
 
-![image-20231021141250877](/home/huian/.config/Typora/typora-user-images/image-20231021141250877.png)
+![image-20231021141250877](src/main/resources/img/image-20231021141250877.png)
 
 #### (6). 基于Redis的Stream结构作为消息队列, 实现异步秒杀下单
 
