@@ -24,6 +24,7 @@ import javax.annotation.Resource;
 import javax.servlet.http.HttpSession;
 
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
@@ -137,6 +138,7 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         user.setPhone(phone);
         user.setNickName(USER_NICK_NAME_PREFIX + RandomUtil.randomNumbers(10));
         save(user);
+        user.setIcon("");
         return user;
     }
 }

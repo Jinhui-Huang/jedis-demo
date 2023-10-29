@@ -3283,3 +3283,291 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
 ### 3. 点赞排行榜
 
+**在探店笔记的详情页面, 应该把给该笔记点赞的人显示出来, 比如最早点赞的TOP5, 形成点赞排行榜:**
+
+#### 实现查询点赞排行榜的接口
+
+需求: 按照点赞时间先后排序, 返回Top5的用户
+
+|          |         List         |     Set      |    SortedSet    |
+| :------: | :------------------: | :----------: | :-------------: |
+| 排序方式 |    按添加顺序排序    |   无法排序   | 根据score值排序 |
+|  唯一性  |        不唯一        |     唯一     |      唯一       |
+| 查找方式 | 按索引查找或首尾查找 | 根据元素查找 |  根据元素查找   |
+
+实现方式: 使用SortedSet
+
+``````java
+@Service
+public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IBlogService {
+
+    @Resource
+    private IUserService userService;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Override
+    public Result queryBlogById(Long id) {
+        /*1. 查询blog*/
+        Blog blog = getById(id);
+        if (blog == null) {
+            return Result.fail("笔记不存在");
+        }
+        /*2. 查询blog有关的用户*/
+        queryBlogUser(blog);
+        /*3. 查询blg是否被点赞*/
+        isBlogLiked(blog);
+        return Result.ok(blog);
+    }
+
+    private void isBlogLiked(Blog blog) {
+        /*1. 获取登录用户*/
+        UserDTO user = UserHolder.getUser(UserDTO.class);
+        if (user != null) {
+            Long userId = user.getId();
+            /*2. 判断当前登录用户是否已经点赞*/
+            String key = BLOG_LIKED_KEY + blog.getId();
+            Boolean isMember = stringRedisTemplate.opsForZSet().score(key, userId.toString()) != null;
+            blog.setIsLike(BooleanUtils.isTrue(isMember));
+        }
+
+    }
+
+
+    @Override
+    public Result likeBlog(Long id) {
+        /*1. 获取登录用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*2. 判断当前登录用户是否已经点赞, 为null则可以点赞*/
+        String key = BLOG_LIKED_KEY + id;
+        Boolean isMember = stringRedisTemplate.opsForZSet().score(key, userId.toString()) != null;
+        /*判断是否点赞*/
+        if (!BooleanUtils.isTrue(isMember)) {
+            /*3. 如果未点赞, 可以点赞*/
+            /*3.1. 数据库点赞数 + 1*/
+            boolean isSuccess = update().setSql("liked = liked + 1").eq("id", id).update();
+            /*3.2. 保存用户到Redis的SortedSet集合中去*/
+            if (isSuccess) {
+                /*zadd key value score*/
+                stringRedisTemplate.opsForZSet().add(key, userId.toString(), System.currentTimeMillis());
+            }
+        } else {
+            /*4. 如果已点赞, 取消点赞*/
+            /*4.1. 数据库点赞数 -1*/
+            boolean isSuccess = update().setSql("liked = liked - 1").eq("id", id).update();
+            /*4.2. 把用户从Redis的SortedSet集合移除*/
+            if (isSuccess) {
+                stringRedisTemplate.opsForZSet().remove(key, userId.toString());
+            }
+        }
+        return Result.ok();
+    }
+
+    @Override
+    public Result queryBlogLikes(Long id) {
+        String key = BLOG_LIKED_KEY + id;
+        /*1. 查询top5的点赞用户 zrange key 0 4*/
+        Set<String> top5 = stringRedisTemplate.opsForZSet().range(key, 0, 4);
+        /*2. 解析用户id*/
+        if (top5 == null || top5.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<Long> ids = top5.stream().map(Long::valueOf).collect(Collectors.toList());
+        String idStr = StrUtil.join(",", ids);
+        /*3. 根据用户id查询用户 WHERE id IN(5, 1) ORDER BY FIELD(id, 5, 1)*/
+        List<UserDTO> userDTOS = userService.query()
+                .in("id", ids).last("ORDER BY FIELD(id, " + idStr + ")").list()
+                .stream()
+                .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+                .collect(Collectors.toList());
+        /*4. 返回*/
+        return Result.ok(userDTOS);
+    }
+}
+
+``````
+
+
+
+## 七. 好友关注
+
+### 1. 关注和取关
+
+在探店图文的详情页面中, 可以关注发布笔记的作者: 
+
+#### 需求: 基于该表数据结构, 实现两个接口:
+
+- 关注和取关接口
+- 判断是否关注的接口
+
+关注是User之间的关系, 是博主与粉丝的关系, 数据库中有一张tb_follow表来标示
+
+``````java
+/**
+ * <p>
+ *  服务实现类
+ * </p>
+ *
+ * @author Jinhui-Huang
+ * @since 2023-10-05
+ */
+@Service
+public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> implements IFollowService {
+
+    /**
+     * Description: follow 关注和取关功能
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/29
+     * */
+    @Override
+    public Result follow(Long followUserId, Boolean isFollow) {
+        /*0. 获取登录用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*1. 判断到底是关注还是取关*/
+        if (isFollow) {
+            /*2. 关注, 新增数据*/
+            Follow follow = new Follow();
+            follow.setUserId(userId);
+            follow.setFollowUserId(followUserId);
+            save(follow);
+        } else {
+            /*3. 取关, 删除 delete from, tb_follow where userId = ? and follow_use_id = ?*/
+            remove(new QueryWrapper<Follow>()
+                    .eq("user_id", userId)
+                    .eq("follow_user_id", followUserId));
+        }
+        return Result.ok();
+    }
+
+    /**
+     * Description: isFollow 判断是否关注
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/29
+     * */
+    @Override
+    public Result isFollow(Long followUserId) {
+        /*0. 获取登录用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*1. 查询是否关注 select count(*) from, tb_follow where userId = ? and follow_use_id = ?*/
+        Integer count = query().eq("user_id", userId)
+                .eq("follow_user_id", followUserId)
+                .count();
+        /*判断count > 0 则关注*/
+        return Result.ok(count > 0);
+    }
+}
+
+``````
+
+
+
+### 2. 共同关注
+
+#### 需求: 利用Redis中恰当的数据结构, 实现共同关注功能.  在博主个人页面展示出当前用户与博主的共同好友.
+
+**更新代码:** 
+
+``````java
+@Service
+public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> implements IFollowService {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
+    private IUserService userService;
+
+    /**
+     * Description: follow 关注和取关功能
+     *
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/29
+     */
+    @Override
+    public Result follow(Long followUserId, Boolean isFollow) {
+        /*0. 获取登录用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        String key = FOLLOWS_KEY + userId;
+        /*1. 判断到底是关注还是取关*/
+        if (isFollow) {
+            /*2. 关注, 新增数据*/
+            Follow follow = new Follow();
+            follow.setUserId(userId);
+            follow.setFollowUserId(followUserId);
+            boolean isSuccess = save(follow);
+            if (isSuccess) {
+                /*保存成功同时把关注用户的id, 存入Redis中去*/
+                /*sadd userID followerUserId*/
+                stringRedisTemplate.opsForSet().add(key, followUserId.toString());
+            }
+        } else {
+            /*3. 取关, 删除 delete from, tb_follow where userId = ? and follow_use_id = ?*/
+            boolean isSuccess = remove(new QueryWrapper<Follow>()
+                    .eq("user_id", userId)
+                    .eq("follow_user_id", followUserId));
+            if (isSuccess) {
+                /*把关注的用户id从redis从集合中移除*/
+                stringRedisTemplate.opsForSet().remove(key, followUserId.toString());
+            }
+        }
+        return Result.ok();
+    }
+
+    /**
+     * Description: isFollow 判断是否关注
+     *
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/29
+     */
+    @Override
+    public Result isFollow(Long followUserId) {
+        /*0. 获取登录用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*1. 查询是否关注 select count(*) from, tb_follow where userId = ? and follow_use_id = ?*/
+        Integer count = query().eq("user_id", userId)
+                .eq("follow_user_id", followUserId)
+                .count();
+        /*判断count > 0 则关注*/
+        return Result.ok(count > 0);
+    }
+
+    @Override
+    public Result followCommons(Long id) {
+        /*1. 获取当前登录用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        String userKey = FOLLOWS_KEY + userId;
+        /*2. 求交集*/
+        String followKey = FOLLOWS_KEY + id;
+        Set<String> intersect = stringRedisTemplate.opsForSet().intersect(userKey, followKey);
+        /*3. 解析id集合*/
+        if (intersect == null || intersect.isEmpty()) {
+            /*无交集*/
+            return Result.ok(Collections.emptyList());
+        }
+        List<Long> ids = intersect.stream().map(Long::valueOf).collect(Collectors.toList());
+        /*4. 查询用户*/
+        List<UserDTO> users = userService.listByIds(ids)
+                .stream()
+                .map(user -> BeanUtil.copyProperties(user, UserDTO.class))
+                .collect(Collectors.toList());
+        /*返回用户*/
+        return Result.ok(users);
+
+    }
+}
+
+``````
+
+
+
+### 3. 关注推送
+
+
+
+
+

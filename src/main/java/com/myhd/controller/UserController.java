@@ -1,6 +1,7 @@
 package com.myhd.controller;
 
 
+import cn.hutool.core.bean.BeanUtil;
 import com.myhd.dto.LoginFormDTO;
 import com.myhd.dto.Result;
 import com.myhd.dto.UserDTO;
@@ -80,5 +81,23 @@ public class UserController {
         info.setUpdateTime(null);
         // 返回
         return Result.ok(info);
+    }
+
+    /**
+     * Description: queryUserById 根据用户id查询用户
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/29
+     * */
+    @GetMapping("/{id}")
+    public Result queryUserById(@PathVariable("id") Long userId) {
+        /*查询详情*/
+        User user = userService.getById(userId);
+        if (user == null) {
+            return Result.ok();
+        }
+        UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
+        /*返回*/
+        return Result.ok(userDTO);
     }
 }
