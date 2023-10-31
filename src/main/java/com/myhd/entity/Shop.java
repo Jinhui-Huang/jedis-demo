@@ -1,5 +1,6 @@
 package com.myhd.entity;
 
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableName;
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
@@ -100,5 +101,9 @@ public class Shop implements Serializable {
      * 更新时间
      */
     private LocalDateTime updateTime;
+
+    /**店铺距离*/
+    @TableField(exist = false)
+    private Double distance;
 
 }

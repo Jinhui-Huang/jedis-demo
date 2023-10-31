@@ -1,20 +1,29 @@
 package com.myhd.service.impl;
 
+import cn.hutool.core.util.StrUtil;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.myhd.utils.CacheClient;
 import com.myhd.dto.Result;
 import com.myhd.entity.Shop;
 import com.myhd.mapper.ShopMapper;
 import com.myhd.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.myhd.utils.RedisConstants;
+import com.myhd.utils.SystemConstants;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.geo.Distance;
+import org.springframework.data.geo.GeoResult;
+import org.springframework.data.geo.GeoResults;
+import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.domain.geo.GeoReference;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
 
 import java.time.Duration;
-import java.util.Random;
+import java.util.*;
 
 import static com.myhd.utils.RedisConstants.*;
 
@@ -67,8 +76,14 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     private Result queryByIdWithLock(Long id) {
         /*解决缓存穿透*/
         /* TODO 缓存雪崩: 防止大量缓存同时失效导致缓存雪崩, 给保存时间再附加一个随机时间让存储时间在30~40*/
-        Shop shop = cacheClient
-                .queryWithPassThroughLock(CACHE_SHOP_KEY,LOCK_SHOP_KEY, id, Shop.class, this::getById, Duration.ofMinutes(CACHE_SHOP_TTL + random.nextInt(11)));
+        Shop shop = cacheClient.queryWithPassThroughLock(
+                        CACHE_SHOP_KEY,
+                        LOCK_SHOP_KEY,
+                        id,
+                        Shop.class,
+                        this::getById,
+                        Duration.ofMinutes(CACHE_SHOP_TTL + random.nextInt(11)
+                        ));
         if (shop == null) {
             return Result.fail("商铺不存在");
         }
@@ -96,6 +111,64 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         /*2. 删除缓存*/
         stringRedisTemplate.delete(CACHE_SHOP_KEY + shop.getId());
         return Result.ok();
+    }
+
+    /**
+     * Description: queryShopByType 按照条件分页查询店铺数据
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/31
+     * */
+    @Override
+    public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+        /*1. 判断是否需要根据坐标查询*/
+        if (x == null || y == null) {
+            /*不需要坐标查询, 按数据库分页查询*/
+            Page<Shop> page = query()
+                    .eq("type_id", typeId)
+                    .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+            return Result.ok(page.getRecords());
+        }
+        /*2. 计算分页参数*/
+        int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
+        int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
+        /*3. 查询redis, 按照距离排序, 分页. 结果: shopId, distance*/
+        /*GEOSEARCH BYLONLAT x y BYRADIUS 10 WITHDISTANCE*/
+        String key = SHOP_GEO_KEY + typeId;
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo().search(
+                key,
+                GeoReference.fromCoordinate(x, y),
+                new Distance(5000),
+                RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().limit(end)
+        );
+        if (results == null) {
+            return Result.ok();
+        }
+        List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+        /*4.0. 截取from ~ end的部分*/
+        /*店铺id集合*/
+        List<Long> ids = new ArrayList<>(list.size());
+        /*店铺距离*/
+        Map<String, Distance> distanceMap = new HashMap<>(list.size());
+        list.stream().skip(from).forEach(result -> {
+            /*4.1. 获取店铺id*/
+            String shopId = result.getContent().getName();
+            ids.add(Long.valueOf(shopId));
+            /*4.2. 获取距离*/
+            Distance distance = result.getDistance();
+            distanceMap.put(shopId, distance);
+        });
+        if (ids.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        /*5. 根据id查询shop*/
+        String idStr = StrUtil.join(",", ids);
+        List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
+        for (Shop shop : shops) {
+            shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
+        }
+        /*6. 返回*/
+        return Result.ok(shops);
     }
 
 
