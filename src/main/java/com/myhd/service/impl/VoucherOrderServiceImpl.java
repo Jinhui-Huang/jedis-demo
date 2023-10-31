@@ -83,7 +83,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         public void run() {
             while (true) {
                 try {
-                    /*1. 获取Redis消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS streams.order >*/
+                    /*1. 获取Redis消息队列中的订单信息 XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS stream.orders > */
                     List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
                             Consumer.from("g1", "c1"),
                             StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
@@ -169,7 +169,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         /*获取锁成功*/
         /*获取锁之后发生了阻塞会产生误删锁的情况*/
         try {
-            /*获取事务的代理对象*/
+            /*事务的代理对象调用创建订单方法*/
             proxy.createVoucherOrder(voucherOrder);
         } finally {
             /*在释放所之前, 获取所版本号发生了阻塞也会产生锁误删的情况*/

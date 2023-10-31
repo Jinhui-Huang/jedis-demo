@@ -3567,7 +3567,208 @@ public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> impleme
 
 ### 3. 关注推送
 
+**关注推送也叫作Feed流, 直译为投喂. 为用户持续的提供"沉浸式"的体验, 通过无线下拉刷新获取新的消息**
+
+![image-20231030094602838](/home/huian/.config/Typora/typora-user-images/image-20231030094602838.png)
 
 
 
+Feed流产品有两种常见模式: 
 
+- **TimeLine:** 不做内容筛选, 简单的按照内容发布时间排序. 常用于好友或关注, 例如朋友圈
+  - 优点: 信息全面, 不会有缺失, 并且实现也相对简单
+  - 缺点: 信息噪音较多, 用户不一定感兴趣, 内容获取效率低
+- **智能排序:** 利用智能算法屏蔽掉违规的, 用户不感兴趣的内容. 推送用户感兴趣信息来吸引用户
+  - 优点: 投喂用户感兴趣信息, 用户粘度很高, 容易沉迷
+  - 缺点: 如果算法不精准, 可能起到反作用
+
+**本例中的个人页面, 是基于关注的好友来做Feed流, 因此采用TimeLine的模式, 该模式实现方案有三种: **
+
+1. 拉模式: 也叫作读扩散
+
+   ![image-20231030095720109](/home/huian/.config/Typora/typora-user-images/image-20231030095720109.png)
+
+2. 推模式: 也叫作写扩散
+
+   ![image-20231030095953667](/home/huian/.config/Typora/typora-user-images/image-20231030095953667.png)
+
+3. 推拉结合: 也叫做读写混合, 兼具推和拉两种模式的优点.
+
+   ![image-20231030100343878](/home/huian/.config/Typora/typora-user-images/image-20231030100343878.png)
+
+|              |  拉模式  |      推模式       |       推拉结合        |
+| :----------: | :------: | :---------------: | :-------------------: |
+|    写比例    |    低    |        高         |          中           |
+|    读比例    |    高    |        低         |          中           |
+| 用户读取延迟 |    高    |        低         |          低           |
+|   实现难度   |   复杂   |       简单        |        很复杂         |
+|   使用场景   | 很少使用 | 用户量少, 没有大V | 过千万的用户量, 有大V |
+
+#### (1). 基于推模式实现关注推送功能
+
+**需求:**
+
+1. 修改新增探店笔记的业务, 在保存blog到数据库的同时, 推送到粉丝的收件箱
+2. 收件箱满足可以根据时间戳排序, 必须用Redis的数据结构实现
+3. 查询收件箱数据时, 可以实现分页查询
+
+**Feed流的分页问题**
+
+Feed流中的数据会不断更新, 所以数据的角标也在变化, 因此不能采用传统的分页模式
+
+![image-20231030102353478](/home/huian/.config/Typora/typora-user-images/image-20231030102353478.png)
+
+**Feed流的滚动分页**
+
+Feed流不采用角标作为分页依据, 而是设置一个lastId来记录每次读取分页数据时最后一条数据的id, 下次再读取数据时, 就可以根据上次分页的lastId来继续读取后面的分页数据
+
+![image-20231030102606420](/home/huian/.config/Typora/typora-user-images/image-20231030102606420.png)
+
+**BlogServiceImpl: **
+
+``````java
+@Service
+public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IBlogService {
+
+    @Resource
+    private IUserService userService;
+
+    @Resource
+    private IFollowService followService;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+    
+	@Override
+    public Result saveBlog(Blog blog) {
+        /*1. 获取登录用户*/
+        UserDTO user = UserHolder.getUser(UserDTO.class);
+        blog.setUserId(user.getId());
+        /*2. 保存探店博文*/
+        boolean isSuccess = save(blog);
+        if (!isSuccess) {
+            return Result.fail("新增笔记失败!");
+        }
+        /*3. 查询笔记作者的所有粉丝*/
+        /*select * from tb_follow where follow_user_id = ?*/
+        List<Follow> follows = followService.query().eq("follow_user_id", user.getId()).list();
+        /*4. 推送笔记id给所有粉丝*/
+        for (Follow follow : follows) {
+            /*4.1. 获取粉丝id*/
+            Long userId = follow.getUserId();
+            /*4.2. 推送到Redis的SortedSet*/
+            String key = FEED_KEY + userId;
+            stringRedisTemplate.opsForZSet().add(key, blog.getId().toString(), System.currentTimeMillis());
+        }
+
+        /*5. 返回id*/
+        return Result.ok(blog.getId());
+    }
+}
+``````
+
+
+
+#### (2). 实现关注推送页面的分页查询
+
+**需求: **在个人主页的"关注"卡片中, 查询并展示推送的Blog信息:
+
+**滚动分页查询参数:**
+
+- max: 当前时间戳 | 上一次查询的最小时间戳
+- min: 0
+- offset: 0 | 在上一次的结果中, 与最小值一样元素的个数
+- count: 3
+
+
+
+**代码实现:**
+
+``````java
+@Service
+public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IBlogService {
+
+    @Resource
+    private IUserService userService;
+
+    @Resource
+    private IFollowService followService;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+    
+	@Override
+    public Result queryBlogOfFollow(Long max, Integer offset) {
+        /*1. 获取当前用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*2. 查询收件箱*/
+        String key = FEED_KEY + userId;
+        /*ZREVRANGEBYSCORE key max min WITHSCORES LIMIT offset count*/
+        Set<ZSetOperations.TypedTuple<String>> typedTuples = stringRedisTemplate.opsForZSet()
+                .reverseRangeByScoreWithScores(key, 0, max, offset, 2);
+        /*3.0. 非空判断*/
+        if (typedTuples == null || typedTuples.isEmpty()) {
+            return Result.ok();
+        }
+        /*3. 解析数据: blogId, minTime(时间戳), offset*/
+        List<Long> ids = new ArrayList<>(typedTuples.size());
+        long minTime = 0;
+        /*偏移量offset*/
+        int os = 1;
+        for (ZSetOperations.TypedTuple<String> typedTuple : typedTuples) {
+            /*3.1. 获取id*/
+            ids.add(Long.valueOf(Objects.requireNonNull(typedTuple.getValue())));
+            /*3.2. 获取分数(时间戳)*/
+            long time = Objects.requireNonNull(typedTuple.getScore()).longValue();
+            /*3.3. 统计偏移量offset*/
+            if (time == minTime) {
+                os++;
+            } else {
+                minTime = time;
+                os = 1;
+            }
+        }
+        /*4. 根据id查询blog*/
+        /*4.1. 需要考虑顺序性, 和blog是否被点赞*/
+        String idStr = StrUtil.join(",", ids);
+        List<Blog> blogs = query().in("id", ids)
+                .last("ORDER BY FIELD(id," + idStr + ")").list();
+        /*4.2. blog是否被当前用户点赞*/
+        for (Blog blog : blogs) {
+            this.queryBlogUser(blog);
+            this.isBlogLiked(blog);
+        }
+        /*5. 封装并返回*/
+        ScrollResult scrollResult = new ScrollResult();
+        scrollResult.setList(blogs);
+        scrollResult.setOffset(os);
+        scrollResult.setMinTime(minTime);
+
+        return Result.ok(scrollResult);
+    }
+}
+``````
+
+
+
+## 八. 附近商户
+
+### 1. GEO数据结构
+
+**GEO就是Geolocation的简写形式, 代表地理坐标. Redis在3.2版本中加入了对GEO的支持, 允许存储地理坐标信息, 帮组我们根据经纬度来检索数据. 常见的命令有:**
+
+- **GEOADD:** 添加一个地理空间信息, 包含: 经度(longitude), 维度(latitude), 值(member)
+- **GEODIST:** 计算指定的两个点之间的距离并返回
+- **GEOHASH:** 将指定member的坐标转为hash字符串形式并返回
+- **GEOPOS:** 返回指定member的坐标
+- **GEORADIUS:** 指定圆心, 半径, 找到该圆内包含的所有member, 并按照与圆心之间的距离排序后返回, 6.2以后已废弃
+- **GEOSEARCH:** 在指定范围内搜索member, 并按照与指定点之间的距离排序后返回, 范围可以是圆形或矩形, 6.2新功能
+- **GEOSEARCHSTORE:** 与GEOSEARCH功能一致, 不过可以把结果存储到一个指定的key. 6.2新功能
+
+**GEOADD:**  GEOADD g1 116.378248 39.865275 bjn 116.42803 39.903738 bjz 116.322287 39.893729 bjx
+
+**GEODIST:** GEODIST g1 bjn bjx km
+
+**GEOSEARCH:** GEOSEARCH g1 FROMLONLAT 116.397904 39.909005 BYRADIUS 10 km WITHDIST
+
+### 2. 附近商户搜索
