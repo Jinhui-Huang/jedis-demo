@@ -40,7 +40,6 @@
 
 
 
-
 ## 二. Redis常见命令
 
 ![image-20231004155340374](src/main/resources/img/image-20231004155340374.png)
@@ -3772,3 +3771,305 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 **GEOSEARCH:** GEOSEARCH g1 FROMLONLAT 116.397904 39.909005 BYRADIUS 10 km WITHDIST
 
 ### 2. 附近商户搜索
+
+按照商户类型分组, 类型相同的商户作为一组, 以typeId为key存入同一个集合中即可
+
+![image-20231031164938079](/home/huian/.config/Typora/typora-user-images/image-20231031164938079.png)
+
+代码实现: 
+
+``````java
+@Slf4j
+@Service
+public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
+    private CacheClient cacheClient;
+
+    @Resource
+    private Random random;
+    
+	/**
+     * Description: queryShopByType 按照条件分页查询店铺数据
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/31
+     * */
+    @Override
+    public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+        /*1. 判断是否需要根据坐标查询*/
+        if (x == null || y == null) {
+            /*不需要坐标查询, 按数据库分页查询*/
+            Page<Shop> page = query()
+                    .eq("type_id", typeId)
+                    .page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+            return Result.ok(page.getRecords());
+        }
+        /*2. 计算分页参数*/
+        int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
+        int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
+        /*3. 查询redis, 按照距离排序, 分页. 结果: shopId, distance*/
+        /*GEOSEARCH BYLONLAT x y BYRADIUS 10 WITHDISTANCE*/
+        String key = SHOP_GEO_KEY + typeId;
+        GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo().search(
+                key,
+                GeoReference.fromCoordinate(x, y),
+                new Distance(5000),
+                RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().limit(end)
+        );
+        if (results == null) {
+            return Result.ok();
+        }
+        List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+        /*4.0. 截取from ~ end的部分*/
+        /*店铺id集合*/
+        List<Long> ids = new ArrayList<>(list.size());
+        /*店铺距离*/
+        Map<String, Distance> distanceMap = new HashMap<>(list.size());
+        list.stream().skip(from).forEach(result -> {
+            /*4.1. 获取店铺id*/
+            String shopId = result.getContent().getName();
+            ids.add(Long.valueOf(shopId));
+            /*4.2. 获取距离*/
+            Distance distance = result.getDistance();
+            distanceMap.put(shopId, distance);
+        });
+        if (ids.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        /*5. 根据id查询shop*/
+        String idStr = StrUtil.join(",", ids);
+        List<Shop> shops = query().in("id", ids).last("ORDER BY FIELD(id," + idStr + ")").list();
+        for (Shop shop : shops) {
+            shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
+        }
+        /*6. 返回*/
+        return Result.ok(shops);
+    }
+}
+``````
+
+
+
+## 九. 用户签到
+
+### 1. BitMap用法
+
+我们按月来统计用户签到信息, 签到记录为1, 未签到则记录为0.
+
+**把每一个bit位对应当月的每一天, 形成了映射关系. 用0和1标示业务状态, 这种思路就称为位图(BitMap)**
+
+**Redis中是利用String类型数据结构实现BitMap, 因此最大上限是512M, 转换为bit则是2^32个bit位**
+
+![image-20231031182451491](/home/huian/.config/Typora/typora-user-images/image-20231031182451491.png)
+
+#### BitMap的操作命令有: 
+
+- **SETBIT:** 向指定位置(offset)存入一个0或1
+
+- **GETBIT:** 获取指定位置(offset)的bit值
+
+- **BITCOUNT:** 统计BitMap中值为1的bit位的数量
+
+- **BITFIELD:** 操作(查询, 修改, 自增) BitMap中bit数组中的指定位置(offset)的值
+
+- **BITFIELD_RO:** 获取BitMap中bit数组, 并以十进制形式返回
+
+- **BITOP:** 将多个BitMap的结果做位运算(与, 或, 异或)
+
+- **BITPOS:** 查找bit数组中指定范围内第一个0或1出现的位置
+
+  
+
+### 2. 签到功能
+
+#### 需求: 实现签到接口, 将当前用户签到信息保存到Redis中
+
+`提示: 因为BitMap底层是基于String数据结构, 因此其操作也都封装在字符串相关操作中了`
+
+代码实现:
+
+``````java
+@Slf4j
+@Service
+public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IUserService {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+    
+	@Override
+    public Result sign() {
+        /*1. 获取当前登录用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*2. 获取日期*/
+        LocalDateTime now = LocalDateTime.now();
+        /*3. 拼接key*/
+        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = USER_SIGN_KEY + userId + keySuffix;
+        /*4. 获取今天是本月第几天*/
+        int dayOfMonth = now.getDayOfMonth();
+        /*5. 写入Redis, SETBIT key offset 1, true表示已签到*/
+        stringRedisTemplate.opsForValue().setBit(key, dayOfMonth - 1, true);
+        return Result.ok();
+    }
+}
+``````
+
+
+
+### 3. 签到统计
+
+**(1). 连续签到:** 从最后一次签到开始向前统计, 直到遇到第一次未签到为止, 计算总的签到次数, 就是连续签到天数.
+
+**(2). 获得本月到今天为止的所有签到数据: ** `BITFIELD key GET u[dayOfMonth] 0`
+
+**(3). 如何从后向钱遍历每个bit位?**: 与1做与运算, 就能的到最后一个bit位, 随后右移1位, 下一个bit位就成为了最后一个bit位.
+
+
+
+代码实现: 
+
+``````java
+@Slf4j
+@Service
+public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IUserService {
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+    
+	/**
+     * Description: signCount 统计连续签到的次数
+     *
+     * @return com.myhd.dto.Result
+     * @author jinhui-huang
+     * @Date 2023/10/31
+     */
+    @Override
+    public Result signCount() {
+        /*1. 获取本月截止今天为止的所有的签到记录*/
+        /*1. 获取当前登录用户*/
+        Long userId = UserHolder.getUser(UserDTO.class).getId();
+        /*2. 获取日期*/
+        LocalDateTime now = LocalDateTime.now();
+        /*3. 拼接key*/
+        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = USER_SIGN_KEY + userId + keySuffix;
+        /*4. 获取今天是本月第几天*/
+        int dayOfMonth = now.getDayOfMonth();
+        /*5. 获取本月截止今天为止的所有的签到记录, 返回的是一个十进制的数字*/
+        /*BITFIELD sign:1010:202310 GET u31 0*/
+        List<Long> result = stringRedisTemplate.opsForValue().bitField(
+                key,
+                BitFieldSubCommands.create().get(
+                        BitFieldSubCommands.BitFieldType.unsigned(dayOfMonth)).valueAt(0)
+        );
+        if (result == null || result.isEmpty()) {
+            /*没有任何结果*/
+            return Result.ok(0);
+        }
+        Long num = result.get(0);
+        if (num == null || num == 0) {
+            return Result.ok(0);
+        }
+        /*6. 循环遍历*/
+        int count = 0;
+        while (true) {
+            /*7. 让这个数字与1做与运算, 得到数字的最后一个bit位*/
+            /*8. 判断这个bit位是否为0*/
+            if ((num & 1) == 0) {
+                /*如果为0, 说明未签到, 结束*/
+                break;
+            } else {
+                /*如果不为0, 说明已签到, 计数器+1*/
+                count++;
+            }
+            /*把数字右移一位, 抛弃这一位, 继续判断下一位, 无符号右移*/
+            num >>>= 1;
+        }
+        return Result.ok(count);
+    }
+}
+``````
+
+
+
+## 十, UV统计
+
+### 1. HyperLogLog用法
+
+- **UV:** 全称**Unique Visitor**, 也叫独立访客量, 是指通过互联网访问, 游览这个网页的自然人. 1天内同一个用户多次访问该网站, 只记录1次.
+- **PV:** 全称**Page View**, 也叫页面访问量或点击量, 用户每访问网站的一个页面, 记录1次PV, 用户多次打开页面, 则记录多次PV. 往往用来衡量网站的流量.
+
+**UV统计在服务端做会比较麻烦, 因为要判断该用户是否已经统计过了, 需要将统计过的用户信息保存. 但是如果每个访问的用户都保存到Redis中, 数据量会非常恐怖.**
+
+**HLL:**
+
+![image-20231031211402191](/home/huian/.config/Typora/typora-user-images/image-20231031211402191.png)
+
+### 2. 实现UV统计
+
+直接利用单元测试, 向HyperLogLog中添加100万条数据, 看看内存占用和统计效果如何
+
+``````java
+class Test{
+
+	@Test
+    void testHyperLogLog() {
+        String[] values = new String[1000];
+        int j = 0;
+        for (int i = 0; i < 1000000; i++) {
+            j = i % 1000;
+            values[j] = "user_" + i;
+            if (j == 999 ) {
+                /*发送数据到Redis*/
+                stringRedisTemplate.opsForHyperLogLog().add("hl2", values);
+            }
+        }
+        /*统计数量*/
+        Long count = stringRedisTemplate.opsForHyperLogLog().size("hl2");
+        System.out.println("count = " + count);
+    	}
+	}
+}
+``````
+
+
+
+## 十一. Redis分布式缓存
+
+**Redis的单点问题:**
+
+![image-20231101154329435](/home/huian/.config/Typora/typora-user-images/image-20231101154329435.png)
+
+### 1. Redis持久化
+
+#### (1). RDB持久化
+
+RDB全称为Redis Database Backup file (Redis数据备份文件), 也被叫做Redis数据快照. 简单来说就是把内存中的所有数据都记录到磁盘中. 当Redis实力故障重启后, 从磁盘读取快照文件, 恢复数据.
+
+快照文件称为RDB文件, 默认是保存在当前运行目录
+
+- **SAVE**: 由Redis主进程来执行RDB, 会阻塞所有命令
+- **BGSAVE:** 开启子进程执行RDB, 避免主进程收到影响
+
+#### (2). AOF持久化
+
+
+
+
+
+### 2. Redis主从
+
+
+
+### 3. Redis哨兵
+
+
+
+### 4. Redis分片集群
+
+
+
