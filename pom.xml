@@ -54,11 +54,11 @@
         </dependency>
 
         <!-- https://mvnrepository.com/artifact/redis.clients/jedis -->
-        <!--<dependency>
+        <dependency>
             <groupId>redis.clients</groupId>
             <artifactId>jedis</artifactId>
             <version>5.0.1</version>
-        </dependency>-->
+        </dependency>
 
         <!--TODO lombok-->
         <dependency>
