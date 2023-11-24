@@ -3196,6 +3196,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 }
             }
         }
+    }
 }
 ``````
 
@@ -4295,7 +4296,7 @@ auto-aof-rewrite-min-size 64mb
 
 #### (2). 搭建哨兵集群
 
-[Redis集群](src/main/resources/Redis集群.md)
+[Redis集群指南](src/main/resources/Redis集群.md)
 
 #### (3). RedisTemplate的哨兵模式
 
@@ -4709,6 +4710,8 @@ printMap(map)
 ### 3. 多级缓存
 
 #### (1). 安装OpenResty
+
+[openresty指南](https://github.com/Jinhui-Huang/redis-demo/blob/master/src/main/resources/%E5%AE%89%E8%A3%85OpenResty.md)
 
 OpenResty 是一个基于Nginx的高性能Web平台, 用于方便地搭建能够处理高并发, 扩展性极高的动态Web应用, Web服务和动态网关. 具备以下特点:
 
@@ -5504,6 +5507,7 @@ public class JedisTest {
   - Pipeline的多个命令之间不具备原子性
 
 
+
 #### (2). 集群模式下的批处理优化
 
 如MSET或Pipeline这样的批处理需要再一次请求中携带多条命令, 而此时如果Redis是一个集群, 那批处理命令的多个key必须落在一个插槽中, 否则就会导致执行失败.
@@ -5651,5 +5655,811 @@ Reids提供了一些命令, 可以查看Redis目前的内存分配状态:
 
 ### 4. 集群最佳实践
 
+集群虽然具备高可用特性, 能实现自动故障恢复, 但是如果使用不当, 也会存在一些问题:
 
+- 集群完整性问题
+- 集群带宽问题
+- 数据倾斜问题
+- 客户端性能问题
+- 命令的集群兼容性问题
+- lua和事务问题
+
+在Redis的默认配置中, 如果发现任意一个插槽不可用, 则整个集群都会停止对外服务:
+
+为了保证高可用性, 这里建议将cluster-require-full-coverage配置为false
+
+
+
+**集群带宽问题**
+
+集群节点之间会不断的互相ping来确定集群中其他节点的状态. 每次ping携带的信息至少包括:
+
+- 插槽信息
+- 集群状态信息
+
+集群中节点越多, 集群状态信息数据量也越大, 10个节点的相关信息可能达到1kb, 此时每次集群互相ping通需要的带宽会非常高.
+
+解决途径:
+
+1. 避免大集群, 集群节点数不要太多, 最好少于1000, 如果业务庞大, 则建立多个集群
+2. 避免在单个物理机中运行太多Redis实例
+3. 配置合适的cluster-node-timeout值
+
+
+
+**注意:**`单体Redis(主从Redis)已经能达到万级别的QPS, 并且也具备很强的高可用特性. 如果主从能满足业务需求的情况下, 尽量不搭建Redis集群`
+
+
+
+## 十四. Redis数据结构
+
+### 1. 动态字符串SDS
+
+Redis没有直接使用C语言中的字符串, 因为C语言字符串存在很多问题:
+
+- 获取字符串长度的需要通过运算
+- 非二进制安全
+- 不可修改
+
+Redis构建了一种新的字符串结构, 称为简单动态字符串(Simple Dynamic String), 简称SDS
+
+``````c
+struct __attribute__ ((__packed__)) sdshdr8 {
+    uint8_t len; // buf已保存的字符串字节数, 不包含结束标示
+    uint8_t alloc; // buf申请的总的字节数, 不包含结束标示
+    unsigned char flags; // 不同SDS的头类型, 用来控制SDS的头大小
+    char buf[];
+};
+``````
+
+SDS之所以叫做动态字符串, 是因为它具备动态扩容的能力
+
+![image-20231117135809860](src/main/resources/img/image-20231117135809860.png)
+
+SDS追加一段字符串, 首先会申请新内存空间:
+
+- 如果新字符串小于1M, 则新空间为扩展后字符串长度的两倍+1
+- 如果新字符串大于1M, 则新空间为扩展后字符串长度+ 1M + 1. 称为内存预分配(申请内存的动作非常消耗性能, linux需要从用户态切换到内核态)
+
+优点:
+
+1. 获取字符串长度的时间复杂度为O(1)
+2. 支持动态扩容
+3. 减少内存分配次数
+4. 二进制安全
+
+
+
+### 2. IntSet
+
+IntSet是Redis中set集合的一种实现方式, 基于整数数组来实现, 并且具备长度可变, 有序等特征.
+
+``````c
+typedef struct intset {
+    uint32_t encoding; // 编码方式, 支持存放16位, 32位, 64位整数
+    uint32_t length; // 元素个数
+    int8_t contents[]; // 整数数组, 保存集合数据
+} intset;
+``````
+
+为了方便查找, Redis会将intset中所有的整数按照升序依次保存在contents数组中, 结构如图:
+
+![image-20231117154523483](src/main/resources/img/image-20231117154523483.png)
+
+**IntSet升级:**
+
+![image-20231117155427859](src/main/resources/img/image-20231117155427859.png)
+
+IntSet可以看做是特殊的整数数组, 具备一些特点:
+
+- Redis会确保IntSet中的元素唯一, 有序
+- 具备类型升级机制, 可以节省内存空间
+- 底层采用二分查找方式来查询
+
+
+
+### 3. Dict
+
+Redis中的键与值值的映射关系正是通过Dict来实现的.
+
+Dict由三部分组成, 分别是: 哈希表(DictHashTable),  哈希节点(DictEntry), 字典(Dict)
+
+![image-20231117163936814](src/main/resources/img/image-20231117163936814.png)
+
+
+
+![image-20231117163804022](src/main/resources/img/image-20231117163804022.png)
+
+![image-20231117164128608](src/main/resources/img/image-20231117164128608.png)
+
+
+
+**Dict的扩容**
+
+Dict中的HashTable就是数组结合单向链表的表现, 当集合中元素较多时, 必然导致哈希冲突增多, 链表过长, 则查询效率会大大降低
+
+Ditc在每次新增键值对时都会检查负载因子 (LoadFactor = used / size), 满足以下两种情况时会触发哈希表扩容:
+
+- 哈希表的LoadFactor >= 1, 并且服务器没有执行BGSAVE 或者 BGREWRITEAOF 等后台进程;
+- 哈希表的LoadFactor > 5;
+
+![image-20231117164823283](src/main/resources/img/image-20231117164823283.png)
+
+Dict除了扩容以外, 每次删除元素时, 也会对负载因子做检查, 当LoadFactor < 0.1 时, 会做哈希表收缩:
+
+![image-20231117165320214](src/main/resources/img/image-20231117165320214.png)
+
+**Dict的rehash**
+
+不管是扩容还是收缩, 必定会创建新的哈希表, 导致哈希表的size和sizemask变化, 而key的查询与sizemask有关. 因此必须对哈希表中的每一个key重新计算, 插入新的哈希表, 这个过程称为rehash. 过程是这样的:
+
+- 计算新的hash表的realeSize, 值取决于当前要做的是扩容还是收缩:
+  - 如果是扩容, 则新size为第一个大于等于dict.ht[0].used + 1的 2^n
+  - 如果是收缩, 则新size为第一个大于等于dict.ht[0].used的 2^n (不得小于4)
+- 按照新的realeSize申请内存空间, 创建dictht, 并赋值给dict.ht[1]
+- 设置dict.rehashidx = 0, 标示开始rehash
+- 将dict.ht[0]中的每一个dictEntry都rehash到dict.ht[1]
+- 将dict.ht[1]赋值给dict.ht[0], 给dict.ht[1]初始化为空哈希表, 释放原来的dict.ht[0]的内存
+
+![image-20231117171142425](src/main/resources/img/image-20231117171142425.png)
+
+
+
+![image-20231117171423150](src/main/resources/img/image-20231117171423150.png)
+
+### 4. ZipList
+
+**ZipList** 是一种特殊的"双端链表", 由一系列特殊编码的连续内存快组成. 可以在任意一端进行压入/弹出操作, 并且该操作的时间复杂度为O(1).
+
+![image-20231117204404992](src/main/resources/img/image-20231117204404992.png)
+
+![image-20231117204426062](src/main/resources/img/image-20231117204426062.png)
+
+**ZipList**中的Entry并不像普通链表那样记录前后节点的指针, 因为记录两个指针要占用16个字节, 浪费内存. 而是采用了下面的结构:
+
+![image-20231117204819178](src/main/resources/img/image-20231117204819178.png)
+
+ZipListEntry中的encoding编码分为字符串和整数两种:
+
+- 字符串: 如果encoding是以"00", "01" 或者 "10" 开头, 则证明content是字符串
+
+![image-20231117205658366](src/main/resources/img/image-20231117205658366.png)
+
+![image-20231117210217376](src/main/resources/img/image-20231117210217376.png)
+
+- 整数: 如果encoding是以"11"开始, 则证明content是整数, 且encoding固定只占用1个字节
+
+![image-20231117210426170](src/main/resources/img/image-20231117210426170.png)
+
+![image-20231117211423521](src/main/resources/img/image-20231117211423521.png)
+
+**ZipList的连锁更新问题**
+
+ZipList的每个Entry都包含previous_entry_length来记录上一个节点的大小, 长度是1个或5个字节:
+
+- 如果前一节点的长度小于254字节, 则采用1个字节来保存这个长度值
+- 如果前一节点的长度大于等于254字节, 则采用5个字节来保存这个长度值, 第一个字节为0xfe, 后四个字节才是真实长度数据
+
+现在, 假设我们有N个连续的, 长度为250~253字节之间的entry, 因此entry的previous_entry_length属性用1个字节即可表示, 如图所示:
+
+![image-20231117212418812](src/main/resources/img/image-20231117212418812.png)
+
+ZipList这种特殊情况下产生的连续多次空间扩展操作称为连锁更新(Cascade Update). 新增, 删除都可能导致连锁更新的发生.
+
+**ZipList特性:**
+
+- 压缩列表的可以看做一种连续内存空间的"双向链表"
+- 列表的节点之间不是通过指针连接, 而是记录上一节点和本节点长度来寻址, 内存占用较低
+- 如果列表数据过多, 导致链表过长, 可能影响查询性能
+- 增或删较大数据时有可能发生连续更新问题
+
+
+
+### 5. QuickList
+
+- 问题1: ZipList虽然节省内存, 但申请内存必须是连续空间, 如果内存占用较多, 申请内存效率很低. 怎么办?
+  - 为了缓解这个问题, 我们必须限制ZipList的长度和entry大小
+- 问题2: 但是我们要存储大量数据, 超出了ZipList最佳上限该怎么办?
+  - 我们可以创建多个ZipList来分片存储数据
+- 问题3: 数据拆分后比较分散, 不方便管理和查找, 这多个ZipList如何建立联系?
+  - Redis在3.2版本引入了新的数据结构QuickList, 它是一个双端链表, 只不过链表中的每一个节点都是一个ZipList.
+
+![image-20231117213625204](src/main/resources/img/image-20231117213625204.png)
+
+
+
+**为了避免QuickList中的每个ZipList中entry过多, Redis提供了一个配置项: list-max-ziplist-size来限制.**
+
+![image-20231117213750211](src/main/resources/img/image-20231117213750211.png)
+
+
+
+**除了空值ZipList的大小, QuickList还可以对节点的ZipList做压缩. 通过配置项list-compress-depth来控制. 因为链表一般都是从首尾访问较多, 所以首尾是不压缩的. 这个参数是空值首尾不压缩的节点个数:**
+
+![image-20231117214128027](src/main/resources/img/image-20231117214128027.png)
+
+**以下是QuickList和QuickListNode的结构和源码:**
+
+![image-20231117214213258](src/main/resources/img/image-20231117214213258.png)
+
+![image-20231117214444389](src/main/resources/img/image-20231117214444389.png)
+
+**QuickList的特点:**
+
+- 是一个节点为ZipList的双端链表
+- 节点采用ZipList, 解决了传统链表的内存占用问题
+- 控制了ZipList大小, 解决连续内存空间申请效率问题
+- 中间节点可以压缩, 进一步节省了内存
+
+
+
+### 6. SkipList
+
+**SkipList(跳表)**搜西安市链表, 但与传统链表相比有几点差异
+
+- 元素按照升序排列存储
+- 节点可能包含多个指针, 指针跨度不同
+
+![image-20231117215732885](src/main/resources/img/image-20231117215732885.png)
+
+SkipList数据结构:
+
+
+
+![image-20231117215931138](src/main/resources/img/image-20231117215931138.png)
+
+![image-20231117220416173](src/main/resources/img/image-20231117220416173.png)
+
+SkipList的特点:
+
+- 跳表是一个双向链表, 每个节点都包含score和ele值
+- 节点按照score值排序, score值一样则按照ele字典排序
+- 每个节点都可以包含多层指针, 层数是1到32之间的随机数
+- 不同层指针到下一个节点的跨度不同, 层级越高, 跨度越大
+- 增删改查效率与红黑树基本一致, 实现却更简单
+
+
+
+### 7. RedisObject
+
+**Redis中的任意数据类型的键和值都会被封装为一个RedisObject, 也叫作Redis对象, 源码如下:**
+
+![image-20231117221404486](src/main/resources/img/image-20231117221404486.png)
+
+**Redis中会根据存储的数据类型不同, 选择不同的编码方式, 共包含11中不同类型:**
+
+![image-20231117221504354](src/main/resources/img/image-20231117221504354.png)
+
+
+
+![image-20231117221543594](src/main/resources/img/image-20231117221543594.png)
+
+
+
+
+
+### 8. 五种数据结构
+
+#### (1). String
+
+String是Redis中最常见的数据存储类型:
+
+- 其基本编码方式是RAW, 基于简单动态字符串(SDS)实现, 存储上限为512mb.
+
+- 如果存储的SDS长度小于44字节, 则会采用EMBSTR编码, 此时object head与SDS是一段连续空间. 申请内存时只需要调用一次内存分配函数, 效率更高.
+
+
+
+#### (2). List
+
+Redis的List类型可以从首, 尾操作列表中的元素:
+
+- LinkedList: 普通链表, 可以从双端访问, 内存占用较高, 内存碎片较多
+- ZipList: 压缩列表, 可以从双端访问, 内存占用低, 存储上限低
+- QuickList: LinkedList + ZipList, 可以从双端访问, 内存占用较低, 包含多个ZipList, 存储上限高
+
+Redis的List结构类似一个双端链表, 可以从首, 尾操作列表中的元素:
+
+- 在3.2版本之前, Redis采用ZipList和LinkedList来实现List, 当元素数量小于512并且元素大小小于64字节时采用ZipList编码, 超过则采用LinkedList编码.
+- 在3.2版本之后, Redis统一采用QuickList来实现List:
+
+![image-20231118180955025](src/main/resources/img/image-20231118180955025.png)
+
+#### (3). Set
+
+Set是Redis中的单列集合, 满足下列特点:
+
+- 不保证有序性
+- 保证元素唯一 (可以判断元素是否存在)
+- 求交集, 并集, 差集
+
+Set对查询元素的效率要求非常高, 什么样的数据结构可以满足
+
+- HashTable, 也就是Redis中的Dict, 不过Dict是双列集合 (可以存储键, 值对)
+- 为了查询效率和唯一性, set采用HT编码 (Dict). Dict中的key用来存储元素, value统一为null.
+- 当存储的所有数据都是整数, 并且元素数量不超过set-max-intset-entries时, Set会采用IntSet编码, 以节省内存.
+
+![image-20231118183852700](src/main/resources/img/image-20231118183852700.png)
+
+#### (4). ZSet
+
+ZSet也就是SortedSet, 其中每一个元素都需要指定一个score值和member值:
+
+- 可以根据score值排序
+- member必须唯一
+- 可以根据member查询分数
+
+因此, zset底层数据结构必须满足键值存储, 键必须唯一, 可排序这几个需求.
+
+- SkipList: 可以排序, 并且可以同时存储score和ele值 (member)
+- HT (Dict): 可以键值存储, 并且可以根据key找value
+
+当元素数量不多时, HT和SkipList的优势不明显, 而且更好内存. 因此zset还会采用ZipList结构来节省内存. 不过需要满足两个条件:
+
+1. 元素数量小于zset_max_ziplist_entries, 默认值128
+2. 每个元素都小于zset_max_ziplist_value字节, 默认值64
+
+![image-20231118190548575](src/main/resources/img/image-20231118190548575.png)
+
+ZipList本身没有排序功能, 而且没有键值对的概念, 因此需要有zset通过编码实现:
+
+- ZipList是连续内存, 因此score和element是紧挨一起的两个entry, element在前, score在后
+- score越小越接近队首, score越大越接近队尾, 按照score值升序
+
+
+
+#### (5). Hash
+
+Hash结构与Redis中的Zset非常类似
+
+- 都是根据键值获取
+- 都需要根据键获取值
+- 键必须唯一
+
+区别如下:
+
+- zset的键是member, 值是score; hash的键和值都是任意值
+- zset要根据score排序; hash则无需排序
+
+因此, Hash底层采用的编码与Zset也基本一致, 只需要把排序有关的SkipList去掉即可:
+
+- Hash结构默认采用ZipList编码, 用以节省内存. ZipList中相邻的两个entry分别保存field和value
+- 当数据量较大的时, Hash结构会转为HT编码, 也就是Dict, 触发条件有两个:
+  - ZipList中的元素数量超过hash-max-ziplist-entries  (默认512)
+  - ZipList中的任意entry大小超过了hash-max-ziplist-value (默认64字节)
+
+
+
+## 十五. Redis网络模型
+
+### 1. 用户空间和内核空间
+
+
+
+![image-20231118194437381](src/main/resources/img/image-20231118194437381.png)
+
+**为了避免用户应用导致冲突甚至内核崩溃, 用户应用与内核是分离的:**
+
+- 进程的寻址空间会划分为两部分: 内核空间, 用户空间
+- 用户空间只能执行受限的命令 (Ring3), 而且不能调用系统资源, 必须通过内核提供的接口来访问
+- 内核空间可以执行特权命令 (Ring0), 调用一切系统资源
+
+![image-20231118195009568](src/main/resources/img/image-20231118195009568.png)
+
+Linus系统为了提高IO效率, 会在用户空间和内核空间都加入了缓冲区:
+
+- 写数据时, 要把用户缓冲数据拷贝到内核缓冲区, 然后写入设备
+- 读数据时, 要从设备读取数据到内核缓冲区, 然后拷贝到用户缓冲区
+
+![image-20231118195303259](src/main/resources/img/image-20231118195303259.png)
+
+
+
+### 2. 阻塞IO (BIO)
+
+顾名思义, 阻塞IO就是两个阶段(用户应用和内核)都必须阻塞等待:
+
+![image-20231118200930501](src/main/resources/img/image-20231118200930501.png)
+
+
+
+### 3. 非阻塞IO (NIO)
+
+顾名思义, 非阻塞IO的recvfrom操作会立即返回结果而不是阻塞用户进程.
+
+![image-20231118201135021](src/main/resources/img/image-20231118201135021.png)
+
+可以看到, 非阻塞IO模型中, 用户进程在第一个阶段是非阻塞, 第二个状态是阻塞状态. 虽然是非阻塞, 但性能并没有得到提高. 而且忙等机制会导致CPU空转, CPU使用率暴增.
+
+
+
+### 4. IO多路复用
+
+无论是阻塞IO还是非阻塞IO, 用户应用在一阶段都需要调用recvfrom来获取数据, 差别在于无数据时的数据方案:
+
+- 如果调用recvfrom时, 恰好没有数据, 阻塞IO会使进程阻塞, 非阻塞IO使CPU空转, 都不能充分发挥CPU的作用.
+- 如果调用recvfrom时, 恰好有数据, 则用户进程可以直接进入第二阶段, 读取并处理数据
+
+比如服务端处理客户端Socket请求时, 在单线程情况下, 只能依次处理每一个socket, 如果正在处理的socket恰好未就绪 (数据不可读或不可写), 线程就会被阻塞, 所有其他客户端socket都必须等待, 性能自然会很差.
+
+提高效率的方法:
+
+1. 方案一: 多线程
+2. 方案二: 数据就绪了, 用户应用就去读取数据
+
+**文件描述符 (File Descriptor):** 简称FD, 是一个从0开始递增的无符号整数, 用来关联Linux中的一个文件. 在Linux中, 一切皆文件, 例如常规文件, 视频, 硬件设备等, 当然也包括网络套接字 (Socket).
+
+**IO多路复用:** 是利用单个线程来同时监听多个FD, 并在某个FD可读, 可写时通知, 从而避免无效的等待, 充分利用CPU资源.
+
+![image-20231121215112644](src/main/resources/img/image-20231121215112644.png)
+
+不过监听FD的方式, 通知的方式又有多种实现, 常见的有:
+
+- select
+- poll
+- epoll
+
+**差异:**
+
+- select和poll只会通知用户进程有FD就绪, 但不确定具体是哪个FD, 需要用户进程逐个便利FD来确认.
+- epoll则会在通知用户进程FD就绪的同时, 把已就绪的FD写入用户空间.
+
+#### (1). IO多路复用-select
+
+select是Linux中最早的I/O多路复用实现方案:
+
+![image-20231121220849219](src/main/resources/img/image-20231121220849219.png)
+
+
+
+#### (2). IO多路复用-poll
+
+poll模式对select模式做了简单改进, 但性能提升不明显, 部分关键代码如下:
+
+![image-20231121223236814](src/main/resources/img/image-20231121223236814.png)
+
+#### (3). IO多路复用-epoll
+
+epoll模式是对select和poll的改进:
+
+![image-20231121223830802](src/main/resources/img/image-20231121223830802.png)
+
+
+
+#### (4). IO多路复用- select, poll, epoll总结:
+
+select模式的存在的三个问题:
+
+- 能监听的FD最大不超过1024
+- 每次select都需要把所有要监听的FD
+- 都拷贝到内核空间
+- 每次都要遍历所有FD来判断就绪状态
+
+poll模式的问题:
+
+- poll利用链表解决了select中监听FD上限的问题, 但依然要遍历所有FD, 如果监听较多, 性能会下降
+
+epoll模式中如何解决这些问题的?
+
+- 基于epoll实例中的红黑树保存要监听的FD, 理论上无上限, 而且增删改查效率都非常高, 性能不会随监听的FD数量增多而下降
+- 每个FD只需要执行一次epoll_ctl添加到红黑树, 以后每次epol_wait无需传递任何参数, 无需重复拷贝FD到内核空间
+
+
+
+#### (5). IO多路复用-事件通知机制
+
+当FD有数据可读时, 我们调用epoll_wait就可以得到通知. 但是事件通知的模式有两种:
+
+- LevelTriggered: 简称LT. 当FD有数据可读时, 会重复通知多次, 直至数据处理完成. 是Epoll的默认模式.
+- EdgeTriggered: 简称ET. 当FD有数据可读时, 只会被通知一次, 不管数据是否处理完成
+
+结论: 
+
+- ET模式避免了LT模式可能出现的惊群现象
+
+- ET模式最好结合非阻塞IO读取FD数据, 相比LT会复杂一些
+
+
+
+#### (6). IO多路复用-web服务流程
+
+基于epoll模式的web服务的基本流程如图:
+
+![image-20231121231022708](src/main/resources/img/image-20231121231022708.png)
+
+
+
+### 5. 信号驱动IO
+
+**信号驱动IO**是与内核建立SIGIO的信号关联并设置回调, 当内核有FD就绪时, 会发出SIGIO信号通知用户, 期间用户应用可以执行其他业务, 无需阻塞等待.
+
+![image-20231122164849487](src/main/resources/img/image-20231122164849487.png)
+
+当有大量IO操作时, 信号较多, SIGIO处理函数不能及时处理可能导致信号队列溢出
+
+而且内核空间与用户空间的频繁信号交互性能也较低.
+
+
+
+### 6. 异步IO (AIO)
+
+异步IO的整个过程都是非阻塞的, 用户进程调用完异步API后就可以去做其他事情, 内核等待数据就绪并拷贝到用户空间后才会递交信号, 通知用户进程.
+
+![image-20231122165531981](src/main/resources/img/image-20231122165531981.png)
+
+IO操作是同步还是异步, 关键看数据在内核空间与用户空间的拷贝过程 (数据读写的IO操作), 也就是阶段二是同步还是异步
+
+
+
+### 7. Redis网络模型
+
+#### (1). Redis到底是单线程还是多线程?
+
+- 如果仅仅聊Redis的核心业务部分 (命令处理), 答案是单线程
+- 如果是聊整个Redis, 那么答案就是多线程
+
+
+
+在Redis版本迭代过程中, 在两个重要的时间节点上引入了多线程的支持:
+
+- Redis v4.0: 引入多线程异步处理一些耗时较长的任务, 例如异步删除命令unlink
+- Redis v6.0: 在核心网络模型中引入多线程, 进一步提高对于多核CPU的利用率
+
+
+
+1. 为什么Redis要选择单线程?
+   - 抛开持久化不谈, Redis是纯内存操作, 执行速度非常快, 它的性能瓶颈是网络延迟而不是执行速度, 因此多线程并不会带来巨大的性能提升.
+   - 多线程会导致过多的上下文切换, 带来不必要的开销.
+   - 引入多线程会面临线程安全问题, 必然要引入线程锁这样的安全手段, 实现复杂度增高, 而且性能也会大打折扣.
+
+#### (2).  Redis6.0以前网络模型
+
+Redis通过IO多路复用来提高性能, 并且支持各种不同的多路复用实现, 并且将这些实现进行封装, 提供例如统一的高性能事件库API库: AE
+
+![image-20231122171420851](src/main/resources/img/image-20231122171420851.png)
+
+![image-20231122175002117](src/main/resources/img/image-20231122175002117.png)
+
+
+
+#### (3). Redis6.0网络模型
+
+Redis 6.0 版本引入了多线程, 目的是为了提高IO读写效率. 因此在**解析客户端命令, 写响应结果**时采用了多线程. 核心的命令执行, IO多路复用模块依然是由主线程执行.
+
+![image-20231122175248983](src/main/resources/img/image-20231122175248983.png)
+
+
+
+## 十六. Redis通信协议
+
+### 1. RESP (Redis Serialiazation Protocol)协议: 
+
+Redis是一个CS架构的软件, 通信一般分两步 (不包括pipeline 和 PubSub):
+
+1. 客户端 (client) 向服务端 (server) 发送一条命令
+2. 服务端解析并执行命令, 返回响应结果给客户端
+
+因此客户端发送命令的格式, 服务端响应结果的格式必须有一个规范, 这个规范就是通信协议.
+
+- Redis 1.2 版本引入了RESP协议
+- Redis 2.0 版本中成为与Reids服务端通信的标准, 称为RESP2
+- Redis 6.0 版本中, 从RESP2升级到了RESP3协议, 增加了更多数据类型并且支持6.0的新特性--客户端缓存
+
+但目前, 默认使用的依然是RESP2协议
+
+
+
+在RESP中, 通过首字节的字符来区分不同数据类型, 常用的数据类型包括5种:
+
+- 单行字符串: 首字节是 '+', 后面跟上单行字符串, 以CRLF ('\r\n') 结尾. 例如返回"OK": "+OK\r\n"
+- 错误 (Errors): 首字节是 '-', 与单行字符串格式一样, 只是字符串是异常信息. 例如: "-Error message\r\n"
+- 数值: 首字节是 ':', 后面跟上数字格式的字符串, 以CRLF结尾. 例如: ":10\r\n"
+- 多行字符串: 首字节是 '$', 表示二进制安全的字符串, 最大支持512MB
+  - 如果大小为0, 则代表空字符串: "$0\r\n\r\n"
+  - 如果大小为-1, 则代表不存在: "$-1\r\n"
+
+![image-20231122181348875](src/main/resources/img/image-20231122181348875.png)
+
+- 数组: 首字节是 '*', 后面跟上数组元素个数, 再跟上元素, 元素数据类型不限:
+
+  ![image-20231122181840953](src/main/resources/img/image-20231122181840953.png)
+
+ 
+
+### 2. 模拟Redis客户端
+
+**RedisClient.java**
+
+``````java
+public class RedisClient {
+
+    private static Socket socket;
+    private static PrintWriter writer;
+    private static BufferedReader reader;
+    private static Object obj;
+
+    public static void main(String[] args) {
+        try {
+            /*1. 建立连接*/
+            String host = "127.0.0.1";
+            int port = 6379;
+            socket = new Socket(host, port);
+            /*2. 获取输出流, 输入流*/
+            writer = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+            reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+            /* 获取授权 auth redis*/
+            sendRequest("auth", "redis");
+            obj = handleResponse();
+            System.out.println("obj = " + obj);
+
+            /*3. 发出请求 set name jack*/
+            sendRequest("set", "name", "王五");
+            /*4. 解析响应*/
+            obj = handleResponse();
+            System.out.println("obj = " + obj);
+
+            /*5. 发出请求 mget name num*/
+            sendRequest("mget", "name", "num");
+            obj = handleResponse();
+            System.out.println("obj = " + obj);
+        } catch (IOException e) {
+            e.printStackTrace();
+        } finally {
+            try {
+                if (reader != null) reader.close();
+                if (writer != null) writer.close();
+                if (socket != null) socket.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+
+    }
+
+    private static Object handleResponse() throws IOException {
+        /* 1. 读取首字节, 判断数据类型*/
+        int read = reader.read();
+        /*2. 判断数据类型*/
+        switch (read) {
+            case '+': /*单行字符串, 直接读一行*/
+                return reader.readLine();
+            case '-': /*异常, 读一行*/
+                throw new RuntimeException(reader.readLine());
+            case ':': /*数字*/
+                return Long.parseLong(reader.readLine());
+            case '$': /*多行字符串*/
+                /*先读长度*/
+                int len = Integer.parseInt(reader.readLine());
+                if (len == -1) {
+                    return null;
+                }
+                if (len == 0) {
+                    return "";
+                }
+                /*再读长度, 读len个字节*/
+                return reader.readLine();
+            case '*': /*数组*/
+                return readBulkString();
+            default:
+                throw new RuntimeException("wrong data type");
+        }
+    }
+
+    /**
+     * Description: readBulkString 处理数组
+     * @return java.lang.Object
+     * @author jinhui-huang
+     * @Date 2023/11/23
+     * */
+    private static Object readBulkString() throws IOException {
+        /*获取数组大小*/
+        int len = Integer.parseInt(reader.readLine());
+        if (len <= 0) {
+            return null;
+        }
+        /*定义集合, 接受多个元素*/
+        List<Object> list = new ArrayList<>();
+        /*遍历, 一次读取每个元素*/
+        for (int i = 0; i < len; i++) {
+            list.add(handleResponse());
+        }
+        return list;
+    }
+
+    /**
+     * Description: sendRequest 发送set请求
+     * @return void
+     * @author jinhui-huang
+     * @Date 2023/11/23
+     * */
+    private static void sendRequest(String ... args) {
+        writer.println("*" + args.length);
+        for (String arg : args) {
+            writer.println("$" + arg.getBytes(StandardCharsets.UTF_8).length);
+            writer.println("$" + arg);
+        }
+        writer.flush();
+    }
+}
+``````
+
+
+
+
+
+
+
+## 十七. Redis内存策略
+
+### 1. 过期策略
+
+**Redis如何知道一个key是否过期?**
+
+`利用两个Dict分别记录key-value对以及key-ttl对`
+
+**key过期后, Redis是不是立即删除**
+
+`采用 惰性删除 和 周期删除`
+
+#### (1). DB结构
+
+Redis本身是一个典型的key-value内存存储数据库, 因此所有的key, value都保存在之前的Dict结构中, 不过在database结构中, 有两个Dict: 一个用来记录key-value; 另一个用来记录key-TTL.
+
+![image-20231124184745008](src/main/resources/img/image-20231124184745008.png)
+
+#### (2). 惰性删除
+
+**惰性删除:** 顾名思义并不是在TTL到期后立即删除, 而是在访问一个key的时候, 检查该key的存活时间, 如果已经过期才执行删除.
+
+
+
+#### (3). 周期删除
+
+**周期删除:** 顾名思义是通过一个定时任务, 周期性的抽样部分过期的key, 然后执行删除. 执行周期有两种:
+
+- Redis会设置一个定时任务serverCron(), 按照server.hz的频率来执行过期key清理, 模式为SLOW
+- Redis的每个事件循环前会调用beforeSleep()函数, 执行过期key清理, 模式为FAST
+
+**SLOW模式规则:**
+
+1. 执行频率受server.hz影响, 默认为10, 即每秒执行10次, 每个执行周期100ms
+2. 执行清理耗时不超过一次执行周期的25%
+3. 逐个遍历db, 逐个遍历db中的bucket, 抽取20个key判断是否过期
+4. 如果没达到时间上限 (25ms) 并且过期key比例大于10%, 再进行一次抽样, 否则结束
+
+ **FAST模式规则 (过期key比例小于10%不执行)**
+
+1. 执行频率受beforeSleep()调用频率影响, 但两次FAST模式间隔不低于2ms
+2. 执行清理耗时不超过1ms
+3. 逐个遍历db, 逐个遍历db中的bucket, 抽取20个key判断是否过期
+4. 如果没达到时间上限 (1ms) 并且过期key比例大于10%, 再进行一次抽样, 否则结束
+
+
+
+### ２. 淘汰策略
+
+**内存淘汰:** 就是当Redis内存使用达到设置的阈值时, Redis主动挑选部分key删除以释放更多内存的流程.
+
+Redis会在处理客户端命令的方法processCommand中尝试做内存淘汰
+
+**Redis支持8种不同策略来选择要删除的key:**
+
+- noeviction: 不淘汰任何key, 但是内存满时不允许写入新数据, 默认就是这种策略
+- volatile-ttl: 对设置了TTL的key, 比较key的剩余TTL值, TTL越小越先被淘汰
+- allkeys-random: 对全体key, 随机进行淘汰. 也就是直接从db->dict中随机挑选
+- volatile-random: 对设置了TTL的key, 随机进行淘汰,  也就是直接从db->expire中随机挑选
+- allkeys-lru: 对全体key, 基于LRU算法进行淘汰
+- volatile-lru: 对设置了TTL的key, 基于LRU算法进行淘汰
+- allkeys-lfu: 对全体key, 基于LFU算法进行淘汰
+- volatile-lfu: 对设置了TTL的key, 基于LFI算法进行淘汰
+
+比较容易混淆的有两个:
+
+- LRU (Least Recently Used), 最少最近使用. 用当前时间减去最后一次访问时间, 这个值越大则淘汰优先级越高
+- LFU (Least Frequently Used), 最少频率使用, 会统计每个key的访问频率, 值越小淘汰优先级越高
+
+![image-20231124195014702](src/main/resources/img/image-20231124195014702.png)
+
+![image-20231124195615437](src/main/resources/img/image-20231124195615437.png)
 
